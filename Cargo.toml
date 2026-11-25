@@ -6,6 +6,7 @@ members = [
     "crates/turn-dag-dag",
     "crates/turn-dag-minter",
     "crates/turn-dag-turn",
+    "crates/turn-dag-node",
 ]
 
 [workspace.package]
