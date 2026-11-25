@@ -1,0 +1,23 @@
+# Runs the Playwright WebRTC suite against the live Rust TURN server.
+# Sub-tests that need a real network path SKIP gracefully on hosts
+# where ICE is policy-blocked; they PASS where the path exists.
+name: browser-test
+on: [push, pull_request]
+jobs:
+  browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: cargo build -p turn-dag-node
+      - run: npm ci
+        working-directory: tests/browser
+      - run: npx playwright install firefox --with-deps
+        working-directory: tests/browser
+      - run: node run.mjs
+        working-directory: tests/browser
+        env:
+          TURN_HOST: 127.0.0.1
