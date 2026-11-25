@@ -1,0 +1,32 @@
+[package]
+name = "turn-dag-fuzz"
+version = "0.1.0"
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+serde_json = "1"
+libfuzzer-sys = "0.4"
+turn-dag-turn = { path = "../crates/turn-dag-turn" }
+turn-dag-dag = { path = "../crates/turn-dag-dag" }
+turn-dag-element = { path = "../crates/turn-dag-element" }
+turn-dag-wallet = { path = "../crates/turn-dag-wallet" }
+
+[[bin]]
+name = "stun_decode"
+path = "fuzz_targets/stun_decode.rs"
+test = false
+
+[[bin]]
+name = "fraud_proof_verify"
+path = "fuzz_targets/fraud_proof_verify.rs"
+test = false
+
+[[bin]]
+name = "channel_data"
+path = "fuzz_targets/channel_data.rs"
+test = false
+
+[workspace]
