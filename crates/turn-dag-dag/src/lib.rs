@@ -1217,11 +1217,15 @@ impl<S: Storage> Dag<S> {
             .reporter_pq_address()
             .ok_or(DagError::BadBlockTypeRule)?;
         let bonded = self.bonded_elements(&owner);
-        if bonded.len() != BOND_SIZE || !validate_slash_split(1, bonded.len().saturating_sub(1)) {
+        // Slash exactly BOND_SIZE elements (1 bounty + 4 burned, the
+        // validate_slash_split rule). Owners bonded above BOND_SIZE
+        // have their extras left in place (they unfreeze per spec, but
+        // the blacklisted key cannot spend them).
+        if bonded.len() < BOND_SIZE || !validate_slash_split(1, BOND_SIZE - 1) {
             return Err(DagError::InvalidSlashSplit);
         }
         let bounty = bonded[0];
-        let burned = bonded[1..].to_vec();
+        let burned = bonded[1..BOND_SIZE].to_vec();
         if let Some(rec) = self.elements.get_mut(&bounty) {
             rec.owner = reporter;
             rec.status = ElementStatus::Unspent;

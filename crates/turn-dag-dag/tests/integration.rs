@@ -719,7 +719,7 @@ fn release_timelock_to_rendezvous_story() {
     let rep = setup_rep(&mut dag);
     let owner = w(50);
     let owner_addr = owner.address();
-    let mut tip = bond(&mut dag, rep, &owner);
+    let tip = bond(&mut dag, rep, &owner);
     assert!(dag.has_confirmed_bond(&owner_addr));
     // A release block for one bonded element starts the timelock.
     let recs = dag.releases();
@@ -772,4 +772,94 @@ fn release_timelock_to_rendezvous_story() {
     let vote = dag.cast_vote(rep, bh);
     assert_eq!(vote, Err(DagError::NoBond));
     assert!(!dag.is_confirmed(&bh));
+}
+
+#[test]
+fn overbonded_owner_is_still_slashable() {
+    // Owner locks 6 elements (legal, >= 5). Slash must still execute:
+    // 1 bounty to reporter + 4 burned; the 6th stays bonded to the
+    // (now blacklisted) owner instead of blocking the slash entirely.
+    let mut dag = Dag::new();
+    let rep = setup_rep(&mut dag);
+    let owner = w(60);
+    let owner_addr = owner.address();
+    let mut tip = bond(&mut dag, rep, &owner);
+    // One extra lock beyond BOND_SIZE.
+    let extra = ElementId([
+        owner_addr.0[0],
+        9,
+        0xB0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ]);
+    dag.register_element(extra, owner_addr);
+    let blk = Block::new(
+        BlockType::BondLock,
+        owner_addr,
+        tip,
+        ZERO_HASH,
+        extra,
+        bond_pseudo_account(&owner_addr),
+    );
+    tip = confirm(&mut dag, rep, sign_block(blk, &owner));
+    assert_eq!(dag.bonded_elements(&owner_addr).len(), 6);
+    // Build a real double-spend proof against the element owner spent.
+    let e = eid(242);
+    dag.register_element(e, owner_addr);
+    let _ = tip;
+    let burn = sign_block(
+        Block::new(BlockType::Burn, owner_addr, tip, ZERO_HASH, e, burn_sink()),
+        &owner,
+    );
+    let _ = burn;
+    // Use the existing slash helper path via a direct proof: reuse the
+    // proven pattern from the slash test (two conflicting burns).
+    let b1 = sign_block(
+        Block::new(BlockType::Burn, owner_addr, tip, ZERO_HASH, e, burn_sink()),
+        &owner,
+    );
+    let mut alt = burn_sink();
+    alt.0[0] ^= 1;
+    let b2 = sign_block(
+        Block::new(BlockType::Burn, owner_addr, tip, ZERO_HASH, e, alt),
+        &owner,
+    );
+    assert_ne!(b1.block_hash(), b2.block_hash());
+    let reporter = w(153).address();
+    let proof = build_fraud_proof(&b1, &b2, reporter, 1);
+    let ph = dag.receive_proof(proof).unwrap();
+    assert!(dag.is_frozen(&owner_addr));
+    let out = dag.execute_slash(ph).unwrap();
+    assert_eq!(out.burned_elements.len(), 4);
+    assert_eq!(dag.element(&out.bounty_element).unwrap().owner, reporter);
+    // The 6th bonded element is untouched (still bonded to blacklisted owner).
+    assert_eq!(dag.element(&extra).unwrap().status, ElementStatus::Bonded);
+    assert!(dag.is_blacklisted_addr(&owner_addr));
 }
