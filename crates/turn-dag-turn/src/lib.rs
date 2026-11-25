@@ -15,6 +15,7 @@
 //! All times are deterministic parameters (unix seconds); no sleeps.
 
 pub mod stack;
+pub mod wire;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use hmac::{Hmac, Mac};

@@ -123,3 +123,32 @@ fn turn_pow_and_mint_pow_are_separate() {
     );
 }
 
+#[test]
+fn turn_wire_server_over_user_space_stack() {
+    use std::net::SocketAddr;
+    use turn_dag_turn::stack::UserSpaceStack;
+    use turn_dag_turn::wire::*;
+    // User-space stack is up (UDP 3478 + TCP socket in same SocketSet).
+    let mut stack = UserSpaceStack::new(
+        smoltcp::wire::IpAddress::Ipv4(smoltcp::wire::Ipv4Address::new(198, 51, 100, 1)),
+        24,
+        3478,
+    );
+    stack.poll(0);
+    assert!(stack.udp_is_open());
+    assert!(stack.tcp_socket_is_user_space());
+    // A real Allocate datagram is answered by the wire server.
+    let mut server = TurnServer::new("198.51.100.1".parse().unwrap());
+    let client: SocketAddr = "203.0.113.7:5000".parse().unwrap();
+    let mut req = StunMessage::new(method::ALLOCATE, Class::Request, [4u8; 12]);
+    req.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+    match server.handle(&req.encode(), client, 100) {
+        HandleOutcome::Response(bytes) => {
+            let resp = StunMessage::decode(&bytes).unwrap();
+            assert_eq!(resp.class, Class::Success);
+            assert!(resp.attr(attr_type::XOR_RELAYED_ADDRESS).is_some());
+        }
+        other => panic!("expected allocate Response, got {other:?}"),
+    }
+    assert_eq!(server.allocation_count(), 1);
+}
