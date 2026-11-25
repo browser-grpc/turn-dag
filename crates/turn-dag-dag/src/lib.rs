@@ -220,7 +220,7 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
 
 // ---------- Storage trait (SQLite can swap in later) ----------
 pub trait Storage {
-    fn put(&mut self, hash: [u8; 32], block: SignedBlock);
+    fn put(&mut self, hash: [u8; 32], block: SignedBlock) -> Result<(), DagError>;
     fn get(&self, hash: &[u8; 32]) -> Option<&SignedBlock>;
     fn contains(&self, hash: &[u8; 32]) -> bool;
     fn hashes(&self) -> Vec<[u8; 32]>;
@@ -230,8 +230,9 @@ pub struct InMemoryStorage {
     map: HashMap<[u8; 32], SignedBlock>,
 }
 impl Storage for InMemoryStorage {
-    fn put(&mut self, hash: [u8; 32], block: SignedBlock) {
+    fn put(&mut self, hash: [u8; 32], block: SignedBlock) -> Result<(), DagError> {
         self.map.insert(hash, block);
+        Ok(())
     }
     fn get(&self, hash: &[u8; 32]) -> Option<&SignedBlock> {
         self.map.get(hash)
@@ -323,21 +324,55 @@ fn decode_signed(b: &[u8]) -> Option<SignedBlock> {
 }
 
 /// SQLite-backed `Storage`: `blocks(block_hash PK, blob)` (spec §9.3 sketch).
-/// Decoded blocks are cached so `get` can return references per the trait.
+/// Blocks are held in `Vec<Box<..>>` (stable heap storage), so `get`
+/// returns safe references without unsafe code; the map is insert-only.
 pub struct SqliteStorage {
     conn: std::cell::RefCell<rusqlite::Connection>,
-    cache: std::cell::RefCell<HashMap<[u8; 32], SignedBlock>>,
+    // Boxed for reference stability: get() returns &SignedBlock, and
+    // heap allocations stay put across Vec growth (plain Vec would move
+    // the values and invalidate outstanding references).
+    #[allow(clippy::vec_box)]
+    blocks: Vec<Box<SignedBlock>>,
+    index: std::collections::HashMap<[u8; 32], usize>,
 }
 impl SqliteStorage {
     pub fn open(path: &str) -> Result<Self, DagError> {
-        let conn = rusqlite::Connection::open(path).map_err(|_| DagError::BadPrevious)?;
+        let conn =
+            rusqlite::Connection::open(path).map_err(|e| DagError::Storage(e.to_string()))?;
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS blocks(block_hash BLOB PRIMARY KEY, blob BLOB NOT NULL);",
+            "PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; \
+             CREATE TABLE IF NOT EXISTS blocks(block_hash BLOB PRIMARY KEY, blob BLOB NOT NULL);",
         )
-        .map_err(|_| DagError::BadPrevious)?;
+        .map_err(|e| DagError::Storage(e.to_string()))?;
+        let mut blocks = Vec::new();
+        let mut index = std::collections::HashMap::new();
+        {
+            let mut stmt = conn
+                .prepare("SELECT block_hash, blob FROM blocks")
+                .map_err(|e| DagError::Storage(e.to_string()))?;
+            let rows = stmt
+                .query_map([], |r| {
+                    Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, Vec<u8>>(1)?))
+                })
+                .map_err(|e| DagError::Storage(e.to_string()))?;
+            for row in rows {
+                let (h, blob) = row.map_err(|e| DagError::Storage(e.to_string()))?;
+                if let (Ok(h32), Some(sb)) =
+                    (<[u8; 32]>::try_from(h.as_slice()), decode_signed(&blob))
+                {
+                    let vacant = !index.contains_key(&h32);
+                    if vacant {
+                        let at = blocks.len();
+                        blocks.push(Box::new(sb));
+                        index.insert(h32, at);
+                    }
+                }
+            }
+        }
         Ok(Self {
             conn: std::cell::RefCell::new(conn),
-            cache: std::cell::RefCell::new(HashMap::new()),
+            blocks,
+            index,
         })
     }
     pub fn in_memory() -> Result<Self, DagError> {
@@ -345,41 +380,28 @@ impl SqliteStorage {
     }
 }
 impl Storage for SqliteStorage {
-    fn put(&mut self, hash: [u8; 32], block: SignedBlock) {
+    fn put(&mut self, hash: [u8; 32], block: SignedBlock) -> Result<(), DagError> {
         let blob = encode_signed(&block);
-        let _ = self.conn.borrow().execute(
-            "INSERT OR REPLACE INTO blocks(block_hash, blob) VALUES (?1, ?2)",
-            rusqlite::params![&hash[..], &blob],
-        );
-        self.cache.borrow_mut().insert(hash, block);
+        self.conn
+            .borrow()
+            .execute(
+                "INSERT OR REPLACE INTO blocks(block_hash, blob) VALUES (?1, ?2)",
+                rusqlite::params![&hash[..], &blob],
+            )
+            .map_err(|e| DagError::Storage(e.to_string()))?;
+        if !self.index.contains_key(&hash) {
+            self.index.insert(hash, self.blocks.len());
+            self.blocks.push(Box::new(block));
+        }
+        Ok(())
     }
     fn get(&self, hash: &[u8; 32]) -> Option<&SignedBlock> {
-        if !self.cache.borrow().contains_key(hash) {
-            let blob: Option<Vec<u8>> = self
-                .conn
-                .borrow()
-                .query_row(
-                    "SELECT blob FROM blocks WHERE block_hash = ?1",
-                    rusqlite::params![&hash[..]],
-                    |r| r.get(0),
-                )
-                .ok();
-            if let Some(b) = blob {
-                if let Some(sb) = decode_signed(&b) {
-                    self.cache.borrow_mut().insert(*hash, sb);
-                }
-            }
-        }
-        // SAFETY of borrow pattern: cache RefCell borrow is returned via a
-        // leaked-then-reborrowed reference tied to &self lifetime by trait.
-        let cache = self.cache.borrow();
-        let ptr = cache.get(hash)? as *const SignedBlock;
-        drop(cache);
-        // The cache entry outlives this call (entries are never evicted).
-        unsafe { Some(&*ptr) }
+        // All rows are eager-loaded at open() and appended by put();
+        // the heap allocations behind Box are stable across Vec growth.
+        self.index.get(hash).map(|&i| &*self.blocks[i])
     }
     fn contains(&self, hash: &[u8; 32]) -> bool {
-        if self.cache.borrow().contains_key(hash) {
+        if self.index.contains_key(hash) {
             return true;
         }
         self.conn
@@ -412,6 +434,7 @@ impl Storage for SqliteStorage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DagError {
     NonCanonical,
+    Storage(String),
     BadSignature,
     AddressMismatch,
     Blacklisted,
@@ -776,7 +799,7 @@ impl<S: Storage> Dag<S> {
             self.register_element(signed.block.element_id, signed.block.account);
         }
         let eid = signed.block.element_id;
-        self.storage.put(hash, signed);
+        self.storage.put(hash, signed)?;
         self.statuses.insert(hash, BlockStatus::Pending);
         self.spent_set.observe(eid, hash, 0);
         let pending: Vec<SignedBlock> = self.pending_missing.values().cloned().collect();

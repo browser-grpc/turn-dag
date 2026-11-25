@@ -548,7 +548,7 @@ fn sqlite_storage_roundtrip_and_dag() {
     blk.epoch = 7;
     let signed = sign_block(blk, &alice);
     let h = signed.block_hash();
-    store.put(h, signed.clone());
+    store.put(h, signed.clone()).unwrap();
     assert!(store.contains(&h));
     assert_eq!(store.get(&h), Some(&signed));
     assert_eq!(store.hashes(), vec![h]);
