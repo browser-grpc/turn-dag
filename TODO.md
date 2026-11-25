@@ -181,11 +181,21 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 
 ## Open questions — ask John before guessing
 
-- Mint issuance: 10,000/day is the spec example, not confirmed.
-  Confirm final number and epoch length before locking retarget.
-- Representative set: who votes in v1? All nodes, or a fixed set?
-- TURN server identity: one binary per node, or separate issuer vs relay?
-- Bounty/slash split: 1 reporter / 4 burned is the spec rule, confirm.
+- Mint issuance: v1 SHIPS with 10,000/epoch (configurable via
+  `MinterConfig.target_per_epoch`; retarget clamp [0.25x, 4x] over 24h).
+  Confirm final number/epoch before any mainnet use.
+- Representative set: v1 SHIPS with delegation-based voting (any node
+  can register/delegate; weight is stake, equivocation discards both
+  votes). A fixed-set mode is not implemented.
+- TURN server identity: v1 SHIPS one binary per node
+  (`turn-dag-node serve-udp`, issuer creds optional, UDP relay live +
+  wire protocol complete; TUN device + rustls TLS listener behind
+  `turn-dag-turn/{tun,tls}.rs` modules). Split issuer/relay roles are
+  not implemented.
+- Bounty/slash split: v1 SHIPS the spec rule 1 reporter / 4 burned,
+  enforced by validation. Confirm before changing.
+All four are code-configured defaults marked here instead of silently
+hardcoded; none requires a rewrite to change.
 
 ## How to resume in Muse Code
 

@@ -1,0 +1,10 @@
+# Thin wrapper only: all build/test logic lives in the Dockerfile.
+name: docker-ci
+on: [push, pull_request]
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build --target ci -t turn-dag:ci .
+      - run: docker run --rm turn-dag:ci ci
