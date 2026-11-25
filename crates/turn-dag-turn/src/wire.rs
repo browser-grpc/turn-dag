@@ -358,6 +358,10 @@ pub struct TurnServer {
     allocations: HashMap<SocketAddr, Allocation>,
     realm: String,
     credentials: HashMap<String, String>,
+    /// REST (issuer) secret: when set, usernames are
+    /// `expiry:pow:<ticket>` and the long-term key derives from the
+    /// issuer HMAC, exactly as TurnIssuer issues them.
+    rest_secret: Option<Vec<u8>>,
     nonce: String,
 }
 impl TurnServer {
@@ -370,8 +374,22 @@ impl TurnServer {
             allocations: HashMap::new(),
             realm: "turn-dag".into(),
             credentials: HashMap::new(),
+            rest_secret: None,
             nonce: String::new(),
         }
+    }
+    /// Verify issuer-issued REST credentials (username=expiry:pow:<ticket>,
+    /// HMAC-SHA1 password) instead of static long-term credentials.
+    pub fn with_rest_auth(mut self, secret: Vec<u8>) -> Self {
+        self.rest_secret = Some(secret);
+        self.nonce = format!("{:016x}", {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(self.server_ip.to_string().as_bytes());
+            h.update(self.realm.as_bytes());
+            u64::from_be_bytes(h.finalize()[..8].try_into().unwrap())
+        });
+        self
     }
     /// Enable long-term credential auth (401 challenge + integrity).
     pub fn with_auth(mut self, realm: &str, credentials: HashMap<String, String>) -> Self {
@@ -388,13 +406,42 @@ impl TurnServer {
     }
     fn auth_key(&self, msg: &StunMessage) -> Option<[u8; 16]> {
         let user = std::str::from_utf8(msg.attr(attr_type::USERNAME)?).ok()?;
-        let password = self.credentials.get(user)?;
-        Some(integrity_key(user, &self.realm, password))
+        let password = if let Some(secret) = &self.rest_secret {
+            crate::credential_password(secret, user)
+        } else {
+            self.credentials.get(user)?.clone()
+        };
+        Some(integrity_key(user, &self.realm, &password))
     }
     /// Ok(key) if the request may proceed (auth off, or valid integrity).
-    fn check_auth(&self, raw: &[u8], msg: &StunMessage) -> Result<Option<[u8; 16]>, StunMessage> {
-        if self.credentials.is_empty() {
+    fn check_auth(
+        &self,
+        raw: &[u8],
+        msg: &StunMessage,
+        now: u64,
+    ) -> Result<Option<[u8; 16]>, StunMessage> {
+        if self.credentials.is_empty() && self.rest_secret.is_none() {
             return Ok(None);
+        }
+        if self.rest_secret.is_some() {
+            let Some(user) = msg
+                .attr(attr_type::USERNAME)
+                .and_then(|v| std::str::from_utf8(v).ok())
+            else {
+                return Err(self.challenge(msg));
+            };
+            let Some((expiry, _ticket)) = crate::parse_username(user) else {
+                return Err(self.challenge(msg));
+            };
+            if now > expiry {
+                return Err(self.challenge(msg));
+            }
+            if let Some(key) = self.auth_key(msg) {
+                if verify_integrity(raw, &key) {
+                    return Ok(Some(key));
+                }
+            }
+            return Err(self.challenge(msg));
         }
         let user = msg
             .attr(attr_type::USERNAME)
@@ -415,13 +462,16 @@ impl TurnServer {
                 }
             }
         }
+        Err(self.challenge(msg))
+    }
+    fn challenge(&self, msg: &StunMessage) -> StunMessage {
         let mut m = StunMessage::new(msg.method, Class::Error, msg.transaction);
         let mut v = vec![0, 0, 4, 1];
         v.extend_from_slice(b"Unauthorized");
         m.push_attr(attr_type::ERROR_CODE, v);
         m.push_attr(attr_type::REALM, self.realm.as_bytes().to_vec());
         m.push_attr(attr_type::NONCE, self.nonce.as_bytes().to_vec());
-        Err(m)
+        m
     }
     pub fn relayed_address(&self, client: &SocketAddr) -> Option<SocketAddr> {
         self.allocations.get(client).map(|a| a.relayed)
@@ -441,7 +491,7 @@ impl TurnServer {
         self.allocations.retain(|_, a| a.expires_at > now);
         // Long-term auth on every TURN method (Binding is exempt).
         let auth_key = if msg.method != method::BINDING && msg.class == Class::Request {
-            match self.check_auth(data, &msg) {
+            match self.check_auth(data, &msg, now) {
                 Ok(k) => k,
                 Err(m) => return HandleOutcome::Response(m.encode()),
             }
@@ -936,6 +986,55 @@ mod tests {
             }
             other => panic!("expected Response, got {other:?}"),
         }
+    }
+    #[test]
+    fn rest_auth_accepts_issuer_credential_and_rejects_expired() {
+        let secret = b"issuer-secret".to_vec();
+        let mut s = TurnServer::new("127.0.0.1".parse().unwrap()).with_rest_auth(secret.clone());
+        // Issuer-shaped username: expiry:pow:ticket.
+        let now = 1_000u64;
+        let username = format!("{}:pow:ticket-1", now + 120);
+        let password = crate::credential_password(&secret, &username);
+        let nonce = s.nonce.clone();
+        let mut m = StunMessage::new(method::ALLOCATE, Class::Request, txn());
+        m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+        m.push_attr(attr_type::USERNAME, username.as_bytes().to_vec());
+        m.push_attr(attr_type::REALM, b"turn-dag".to_vec());
+        m.push_attr(attr_type::NONCE, nonce.as_bytes().to_vec());
+        let raw = sign_wire(m, Some(&integrity_key(&username, "turn-dag", &password)));
+        match s.handle(&raw, client(), now) {
+            HandleOutcome::Response(b) => {
+                let r = StunMessage::decode(&b).unwrap();
+                assert_eq!(r.class, Class::Success, "{r:?}");
+            }
+            other => panic!("expected allocate success, got {other:?}"),
+        }
+        // Expired credential (now past expiry) gets 401.
+        let raw2 = sign_wire(
+            {
+                let mut m = StunMessage::new(method::ALLOCATE, Class::Request, txn());
+                m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+                m.push_attr(attr_type::USERNAME, username.as_bytes().to_vec());
+                m.push_attr(attr_type::REALM, b"turn-dag".to_vec());
+                m.push_attr(attr_type::NONCE, nonce.as_bytes().to_vec());
+                m
+            },
+            Some(&integrity_key(&username, "turn-dag", &password)),
+        );
+        let out = s.handle(&raw2, client(), now + 200);
+        assert_eq!(error_code(&decode_ok(out)), Some(401));
+        // Wrong secret fails integrity.
+        let other = {
+            let mut m = StunMessage::new(method::ALLOCATE, Class::Request, txn());
+            m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+            m.push_attr(attr_type::USERNAME, username.as_bytes().to_vec());
+            m.push_attr(attr_type::REALM, b"turn-dag".to_vec());
+            m.push_attr(attr_type::NONCE, nonce.as_bytes().to_vec());
+            m
+        };
+        let bad = sign_wire(other, Some(&integrity_key(&username, "turn-dag", "forged")));
+        let out = s.handle(&bad, client(), now);
+        assert_eq!(error_code(&decode_ok(out)), Some(401));
     }
     fn auth_server() -> TurnServer {
         let mut creds = std::collections::HashMap::new();

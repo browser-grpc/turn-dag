@@ -43,10 +43,11 @@ impl Default for MinterConfig {
             target_per_epoch: 10_000,
             epoch_secs: 86_400,
             challenge_ttl_secs: 30,
-            // Production-flavoured default; tests override with cheap params.
-            argon_m_cost_kib: 4_096,
-            argon_t_cost: 1,
-            argon_p_cost: 1,
+            // ASIC-resistant default (64 MiB, t=3, p=4): the spec rejects
+            // SHA256 PoW precisely because GPU/ASICs trivialize it.
+            argon_m_cost_kib: 65_536,
+            argon_t_cost: 3,
+            argon_p_cost: 4,
             argon_out_len: 32,
         }
     }

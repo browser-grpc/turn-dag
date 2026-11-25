@@ -47,6 +47,7 @@ fn serve_udp(args: &[String]) -> i32 {
     let mut relay_ip: Option<String> = None;
     let mut user: Option<String> = None;
     let mut pass: Option<String> = None;
+    let mut rest_secret: Option<String> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -54,6 +55,7 @@ fn serve_udp(args: &[String]) -> i32 {
             "--relay-ip" => relay_ip = it.next().cloned(),
             "--user" => user = it.next().cloned(),
             "--pass" => pass = it.next().cloned(),
+            "--rest-secret" => rest_secret = it.next().cloned(),
             _ => {
                 eprintln!("unknown serve-udp arg: {a}");
                 return 2;
@@ -68,7 +70,16 @@ fn serve_udp(args: &[String]) -> i32 {
         .and_then(|r| r.parse().ok())
         .unwrap_or(sock_addr.ip());
     let mut server = turn_dag_turn::wire::TurnServer::new(relay);
-    if let (Some(u), Some(p)) = (user, pass) {
+    if let Some(hex_secret) = rest_secret {
+        let secret = turn_dag_dag::hex_decode(&hex_secret).unwrap_or_default();
+        // Issuer REST credentials (username=expiry:pow:<ticket>): the
+        // long-term key derives from the issuer HMAC, as TurnIssuer
+        // issues them. Dev note: the burn-confirmation gate that
+        // precedes credential issuance still needs DAG state wired in
+        // (see TODO read-me), so REST auth alone is necessary but not
+        // yet sufficient for mainnet rendezvous.
+        server = server.with_rest_auth(secret);
+    } else if let (Some(u), Some(p)) = (user, pass) {
         let mut creds = std::collections::HashMap::new();
         creds.insert(u, p);
         server = server.with_auth("turn-dag", creds);
