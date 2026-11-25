@@ -64,6 +64,7 @@ impl Node {
             .cast_vote(self.rep, h)
             .map_err(|e| format!("vote: {e:?}"))?;
         self.dag.confirm_step();
+        self.dag.confirm_step();
         if self.dag.block_status(&h) == Some(BlockStatus::Confirmed) {
             Ok(h)
         } else {
@@ -101,6 +102,7 @@ pub fn bond(dag: &mut Dag, rep: PqAddress, owner: &HotWallet) -> Result<[u8; 32]
         dag.cast_vote(rep, h)
             .map_err(|e| format!("bond vote: {e:?}"))?;
         dag.confirm_step();
+        dag.confirm_step();
         if dag.block_status(&h) != Some(BlockStatus::Confirmed) {
             return Err("bond not confirmed".into());
         }
@@ -117,6 +119,7 @@ pub fn confirm_on(dag: &mut Dag, rep: PqAddress, signed: SignedBlock) -> Result<
     dag.insert_block(signed)
         .map_err(|e| format!("insert: {e:?}"))?;
     dag.cast_vote(rep, h).map_err(|e| format!("vote: {e:?}"))?;
+    dag.confirm_step();
     dag.confirm_step();
     if dag.block_status(&h) == Some(BlockStatus::Confirmed) {
         Ok(h)

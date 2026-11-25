@@ -718,6 +718,13 @@ impl<S: Storage> Dag<S> {
 
     // ----- insert_block: ordered fail-closed validation (spec 9.4) -----
     pub fn insert_block(&mut self, signed: SignedBlock) -> Result<InsertOutcome, DagError> {
+        // Freeze-on-gossip: honest nodes stop voting for this owner's new
+        // spends until the slash vote resolves. Local and reversible.
+        if self.frozen.contains(&signed.block.account)
+            && matches!(signed.block.block_type, BlockType::Burn | BlockType::Send)
+        {
+            return Err(DagError::Blacklisted);
+        }
         let hash = signed.block_hash();
         if signed.block.version != 1 {
             return Err(DagError::NonCanonical);
@@ -940,7 +947,6 @@ impl<S: Storage> Dag<S> {
         {
             return Err(DagError::NoBond);
         }
-        self.online_reps.insert(rep);
         let fid = ForkId::from(&b);
         if self
             .equivocated
@@ -1050,7 +1056,7 @@ impl<S: Storage> Dag<S> {
                     *e += 1;
                     *e
                 };
-                if s >= 1 {
+                if s >= 2 {
                     to_confirm.push(*h);
                 }
             } else {
@@ -1186,7 +1192,6 @@ impl<S: Storage> Dag<S> {
         if !self.proofs.contains_key(&proof_hash) {
             return Err(DagError::UnknownProof);
         }
-        self.online_reps.insert(rep);
         self.slash_votes.entry(proof_hash).or_default().insert(rep);
         let online = self.online_weight();
         let weight: u64 = self

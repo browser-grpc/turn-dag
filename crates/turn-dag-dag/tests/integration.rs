@@ -10,6 +10,8 @@ fn confirm<S: Storage>(dag: &mut Dag<S>, rep: PqAddress, signed: SignedBlock) ->
     let h = signed.block_hash();
     dag.insert_block(signed).unwrap();
     dag.cast_vote(rep, h).unwrap();
+    // Finality now needs two sustained ticks (one full 5s epoch).
+    dag.confirm_step();
     dag.confirm_step();
     assert_eq!(
         dag.block_status(&h),
@@ -150,6 +152,7 @@ fn example_b_double_spend_fork_loser_orphaned() {
         InsertOutcome::Duplicate { .. }
     ));
     dag.cast_vote(rep, h1).unwrap();
+    dag.confirm_step();
     dag.confirm_step();
     assert_eq!(dag.block_status(&h1), Some(BlockStatus::Confirmed));
     assert_eq!(dag.block_status(&h2), Some(BlockStatus::Orphaned));
@@ -741,6 +744,7 @@ fn release_timelock_to_rendezvous_story() {
     let h = rel.block_hash();
     dag.insert_block(rel).unwrap();
     dag.cast_vote(rep, h).unwrap();
+    dag.confirm_step();
     dag.confirm_step();
     assert!(dag.is_confirmed(&h));
     let rec = dag.request_release_record(&owner_addr).unwrap().clone();

@@ -22,6 +22,7 @@ fn confirm_all(nodes: &mut [Node], signed: SignedBlock) -> [u8; 32] {
         n.dag.insert_block(signed.clone()).unwrap();
         n.dag.cast_vote(n.rep, h).unwrap();
         n.dag.confirm_step();
+        n.dag.confirm_step();
         assert_eq!(
             n.dag.block_status(&h),
             Some(BlockStatus::Confirmed),
@@ -198,6 +199,7 @@ fn example_b_double_spend_race_two_issuers_neither_allocates_before_confirmation
     // Burn branch wins the vote on every node; send branch is orphaned.
     for n in nodes.iter_mut() {
         n.dag.cast_vote(n.rep, burn_h).unwrap();
+        n.dag.confirm_step();
         n.dag.confirm_step();
         assert_eq!(n.dag.block_status(&burn_h), Some(BlockStatus::Confirmed));
         assert_eq!(n.dag.block_status(&send_h), Some(BlockStatus::Orphaned));
