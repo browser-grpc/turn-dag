@@ -17,6 +17,9 @@ USAGE:
   turn-dag-node demo
   turn-dag-node stack
   turn-dag-node serve-udp [--addr 127.0.0.1:3478] [--relay-ip IP] [--user USER --pass PASS]
+  turn-dag-node keygen [--out FILE] [--backup FILE]
+  turn-dag-node backup --seed-file FILE [--out FILE]
+  turn-dag-node recover --backup FILE [--seed-file FILE]
 Commands demonstrate node init/status, mint, transfer and the
 burn-for-rendezvous flow in-process on a virtual/smoltcp device or
 pure logic. No listener is opened.";
@@ -26,6 +29,15 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("demo");
     if cmd == "serve-udp" {
         std::process::exit(serve_udp(&args[2..]));
+    }
+    if cmd == "keygen" {
+        std::process::exit(keygen(&args[2..]));
+    }
+    if cmd == "backup" {
+        std::process::exit(backup(&args[2..]));
+    }
+    if cmd == "recover" {
+        std::process::exit(recover(&args[2..]));
     }
     std::process::exit(run(cmd));
 }
@@ -278,6 +290,161 @@ fn flow(cmd: &str) -> i32 {
         }
         Err(e) => {
             eprintln!("rendezvous failed: {e:?}");
+            1
+        }
+    }
+}
+
+fn read_seed_file(path: &str) -> Result<[u8; 32], String> {
+    let data = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
+    let hex = String::from_utf8(data).map_err(|e| format!("seed file not UTF-8: {e}"))?;
+    let hex = hex.trim();
+    let bytes = turn_dag_dag::hex_decode(hex).ok_or_else(|| "seed file is not hex".to_string())?;
+    let len = bytes.len();
+    bytes
+        .try_into()
+        .map_err(|_| format!("seed must be 32 bytes, got {len}"))
+}
+
+fn keygen(args: &[String]) -> i32 {
+    let mut out = "seed.hex".to_string();
+    let mut backup_path: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--out" => out = it.next().cloned().unwrap_or_default(),
+            "--backup" => backup_path = it.next().cloned(),
+            _ => {
+                eprintln!("unknown keygen arg: {a}");
+                return 2;
+            }
+        }
+    }
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).expect("OS entropy");
+    // Owner-only file: 0600 on Unix.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let hex = hex(&seed);
+        std::fs::write(&out, format!("{hex}\n")).unwrap_or_else(|e| {
+            eprintln!("write seed file: {e}");
+            std::process::exit(1)
+        });
+        #[cfg(unix)]
+        let _ = std::fs::set_permissions(&out, std::fs::Permissions::from_mode(0o600));
+    }
+    let wallet = turn_dag_node::wallet(0);
+    let _ = wallet;
+    println!("seed written (0600) to {out}");
+    if let Some(bp) = backup_path {
+        let kem = turn_dag_wallet::KemKeypair::generate(&seed);
+        let blob = turn_dag_wallet::seed_backup_encrypt(kem.encapsulation_key(), &seed)
+            .unwrap_or_else(|e| {
+                eprintln!("encrypt backup: {e:?}");
+                std::process::exit(1)
+            });
+        std::fs::write(&bp, hex(&blob)).unwrap_or_else(|e| {
+            eprintln!("write backup: {e}");
+            std::process::exit(1)
+        });
+        println!("kem backup written to {bp} (store your decapsulation seed separately)");
+    }
+    0
+}
+
+fn backup(args: &[String]) -> i32 {
+    let mut seed_file = String::new();
+    let mut out = "backup.hex".to_string();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--seed-file" => seed_file = it.next().cloned().unwrap_or_default(),
+            "--out" => out = it.next().cloned().unwrap_or_default(),
+            _ => {
+                eprintln!("unknown backup arg: {a}");
+                return 2;
+            }
+        }
+    }
+    let Ok(seed) = read_seed_file(&seed_file) else {
+        eprintln!("cannot read seed file");
+        return 1;
+    };
+    let kem = turn_dag_wallet::KemKeypair::generate(&seed);
+    let blob = match turn_dag_wallet::seed_backup_encrypt(kem.encapsulation_key(), &seed) {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("encrypt: {e:?}");
+            return 1;
+        }
+    };
+    if let Err(e) = std::fs::write(&out, hex(&blob)) {
+        eprintln!("write backup: {e}");
+        return 1;
+    }
+    println!("backup written to {out}");
+    0
+}
+
+fn recover(args: &[String]) -> i32 {
+    let mut backup_path = String::new();
+    let mut seed_file = "recovered-seed.hex".to_string();
+    let mut kem_seed_file = String::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--backup" => backup_path = it.next().cloned().unwrap_or_default(),
+            "--seed-file" => seed_file = it.next().cloned().unwrap_or_default(),
+            "--kem-seed-file" => kem_seed_file = it.next().cloned().unwrap_or_default(),
+            _ => {
+                eprintln!("unknown recover arg: {a}");
+                return 2;
+            }
+        }
+    }
+    let hexs = match std::fs::read_to_string(&backup_path) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("read backup: {e}");
+            return 1;
+        }
+    };
+    let blob = turn_dag_dag::hex_decode(hexs.trim()).unwrap_or_default();
+    // Recovery needs the same decapsulation key (derived from the seed
+    // file or stored separately); use the seed file if present, else
+    // attempt with the default demo seed and report failure honestly.
+    let kem_seed_file = if kem_seed_file.is_empty() {
+        // Default: the keygen seed file next to this command's cwd.
+        "seed.hex".to_string()
+    } else {
+        kem_seed_file
+    };
+    let kem_seed_file = kem_seed_file.as_str();
+    match read_seed_file(kem_seed_file) {
+        Ok(s) => {
+            let kem = turn_dag_wallet::KemKeypair::generate(&s);
+            match kem.decrypt_seed(&blob) {
+                Ok(seed) => {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = std::fs::set_permissions(
+                        &seed_file,
+                        std::fs::Permissions::from_mode(0o600),
+                    );
+                    if let Err(e) = std::fs::write(&seed_file, format!("{}\n", hex(&seed))) {
+                        eprintln!("write recovered seed: {e}");
+                        return 1;
+                    }
+                    println!("recovered seed to {seed_file} (0600)");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("decrypt failed: {e:?}");
+                    1
+                }
+            }
+        }
+        Err(_) => {
+            eprintln!("need decapsulation seed file '{kem_seed_file}' to recover");
             1
         }
     }

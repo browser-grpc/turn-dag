@@ -361,3 +361,53 @@ fn cli_help_and_demo_flows() {
         .unwrap();
     assert_eq!(bad.status.code(), Some(2));
 }
+
+#[test]
+fn cli_keygen_backup_recover_roundtrip() {
+    use std::process::Command;
+    let dir = std::env::temp_dir().join("turndag-keygen-test");
+    let _ = std::fs::create_dir_all(&dir);
+    let seed = dir.join("seed.hex");
+    let backup = dir.join("backup.hex");
+    let recovered = dir.join("recovered.hex");
+    let bin = env!("CARGO_BIN_EXE_turn-dag-node");
+    let st = Command::new(bin)
+        .args([
+            "keygen",
+            "--out",
+            seed.to_str().unwrap(),
+            "--backup",
+            backup.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    // Seed file is owner-only (0600 on Unix).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&seed).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+    assert!(backup.exists());
+    // Recover into a different file: byte-identical seed.
+    let st = Command::new(bin)
+        .args([
+            "recover",
+            "--backup",
+            backup.to_str().unwrap(),
+            "--seed-file",
+            recovered.to_str().unwrap(),
+            "--kem-seed-file",
+            seed.to_str().unwrap(),
+        ])
+        .status()
+        .unwrap();
+    assert!(st.success());
+    assert_eq!(
+        std::fs::read(&seed).unwrap(),
+        std::fs::read(&recovered).unwrap(),
+        "recovered seed must match"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
