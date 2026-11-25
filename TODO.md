@@ -77,21 +77,22 @@ before writing code. Implementation language is **Rust**.
 
 ## Current state (2026-11-25)
 
-- Repo has 3 commits, no code yet:
-  - c396c3b — README.md, LICENSE, Dockerfile
-  - 29056c3 — docs/bond-contract-fraud-proof-spec.pdf
-  - 439ab8d — scripts/build.sh, scripts/test.sh
-- Files on disk / in repo: `README.md`, `LICENSE`, `Dockerfile`,
-  `docs/bond-contract-fraud-proof-spec.pdf`, `scripts/build.sh`,
-  `scripts/test.sh`, this `TODO.md` (to be committed next).
-- Local staging on the assistant VM: `~/workspace/turn-dag-staging/`
-  Mac copy: `/Users/jdavis/Downloads/turn-dag/`
+- Steps 1–8 implemented in Rust (6-crate workspace, uncommitted for review):
+  element/wallet, DAG, minter, TURN issuer + smoltcp stack, node binary.
+- PQ status: HotWallet uses the REAL `ml-dsa` 0.1.2 crate (ML-DSA-65,
+  pub 1952B / sig 3309B). ColdWallet SLH-DSA-128s and ML-KEM seed backup
+  were test doubles; as of the coverage pass ALL PQ is real (see §3).
+- TURN handlers are pure data models; smoltcp stack is a virtual-device
+  transport only — no live TURN wire-protocol server yet.
+- `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`,
+  `cargo fmt --all -- --check`, `docker build` + `docker run --rm turn-dag test`
+  all pass (Docker needs Rust 1.87: `ml-dsa` requires rustc ≥1.87).
 
 ## Implementation in Rust — work plan
 
 Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 
-### 1. Workspace skeleton
+### 1. Workspace skeleton — [x] done (6 crates, fmt/clippy in Dockerfile+scripts)
 - `Cargo.toml` workspace, edition 2021, Rust 1.85+.
 - Crates: `turn-dag-element`, `turn-dag-wallet`, `turn-dag-dag`,
   `turn-dag-minter`, `turn-dag-turn`, `turn-dag-node` (binary).
@@ -99,7 +100,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 - Keep `Dockerfile` as the only build/test entrypoint; update it if a
   new crate needs a system dep, do not add host setup docs.
 
-### 2. Element / UTXO types
+### 2. Element / UTXO types — [x] done (turn-dag-element; nonce fixed 0, burn sink SHA3-256("burn")[:20])
 - `ElementId = SHA256(challenge || nonce || miner_pq_address)`
 - `Element { id, owner: PqAddress, status: Unspent|Spent|Burned, mint_epoch }`
 - No amount field. Any split / amount != 1 is rejected.
@@ -110,7 +111,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   record with same element_id and new owner (provenance preserved).
 - Burn: transfer to sink `SHA3-256("burn")`.
 
-### 3. PQ wallet
+### 3. PQ wallet — [x] done, all real crates (hot ML-DSA-65 `ml-dsa`; cold SLH-DSA-SHA2-128s `slh-dsa` 32B/7856B; ML-KEM-768 `ml-kem` seed backup; signature pinned =2.3.0-pre.4 for slh-dsa)
 - Crates: `pqcrypto-dilithium` / `liboqs` bindings, or `pqcrypto` + `oqs`.
   Verify ML-DSA-65 sizes against spec before locking a crate.
 - `Wallet::generate() -> 32-byte seed`, `address()`, `sign()`, `verify()`.
@@ -119,7 +120,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 - Tests: known-answer / round-trip sign-verify, wrong-key fails,
   address derivation is deterministic.
 
-### 4. DAG / block-lattice
+### 4. DAG / block-lattice — [x] done (turn-dag-dag; Storage trait with InMemory + SQLite `SqliteStorage` impls, blocks table per §9.3)
 - `Block { id, owner_chain, predecessor, parents: [own_prev, cross_tip], payload: Mint|Transfer|BondLock|BondRelease|SlashClaim, sig }`
 - Per-wallet chain, append-only, fork detection: two blocks with same
   predecessor = fork.
@@ -133,7 +134,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   from spec § (elements, blocks, votes, bonds, blacklist). Keep the
   storage trait so a later embedded store can swap in.
 
-### 5. PoW minter
+### 5. PoW minter — [x] done (argon2 Argon2id, epoch-bound challenges, retarget clamp 0.25x-4x, economics >=100x test)
 - Argon2id (crate `argon2`) default, RandomX behind a feature flag.
 - Challenge: random, difficulty, 30s expiry, IP-bound for TURN PoW;
   mint challenge is epoch-bound, not IP-bound.
@@ -144,7 +145,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 - Economics test: mint cost in time, double-spend gain ~$0.00002,
   slash loss 5 elements, assert ≥100x penalty in a test.
 
-### 6. TURN issuer + smoltcp TURN
+### 6. TURN issuer + smoltcp TURN — [x] done: pure-logic issuer + smoltcp VirtualDevice stack + TURN wire server (Allocate/Refresh/Permission/ChannelBind/Send-Data). Not yet: live TUN/TAP device, rustls TLS listener
 - Issuer API: `GET /challenge`, `POST /redeem` → 120s TURN creds,
   `username = expiry:pow:<ticket_id>`, 1 ticket per allocation,
   2 tickets per rendezvous if both peers are behind symmetric NAT.
@@ -158,7 +159,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 - Tests: SSRF blocked (169.254.169.254, RFC1918, loopback), quota
   enforced, 120s expiry enforced, 1.9 MB cap enforced.
 
-### 7. Bond + fraud proof + slashing
+### 7. Bond + fraud proof + slashing — [x] done (5-element bond, 5-condition fraud proof ~12.6KB JSON, slash 1 bounty/4 burned; Examples A/B/C as tests)
 - Bond lock blocks: 5 elements, spend gate in voter logic.
 - Fraud proof wire format from spec: `{element_id, tx1, sig1, tx2, sig2,
   fork_block_a, fork_block_b, predecessor}`.
@@ -171,7 +172,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   C (slash) — turn each into a Rust test. Hashes in the spec are
   shortened illustrative fragments, not test vectors — recompute them.
 
-### 8. Node binary + Docker
+### 8. Node binary + Docker — [x] done (turn-dag-node CLI, workspace integration tests incl. 3-node A/B/C + two-issuer race + TCP audit; Dockerfile/scripts run real cargo; docker build/run verified; no GitHub Actions YAML added)
 - `turn-dag-node`: DAG node + minter + issuer + TURN, all on smoltcp.
 - `docker build -t turn-dag .`, `docker run --rm turn-dag test`,
   `docker run --rm turn-dag ci` must pass before any push.
