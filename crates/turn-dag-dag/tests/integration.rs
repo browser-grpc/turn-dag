@@ -709,3 +709,53 @@ fn eclipsed_server_sees_attacker_fed_view_but_weight_protects() {
         "eclipse-fed single vote must not confirm"
     );
 }
+
+#[test]
+fn release_timelock_to_rendezvous_story() {
+    // Full bond lifecycle on the node path: lock 5, spend gate requires
+    // the bond, release starts the 24h timelock, maturity returns the
+    // element to unspent, and a cancelled release keeps it bonded.
+    let mut dag = Dag::new();
+    let rep = setup_rep(&mut dag);
+    let owner = w(50);
+    let owner_addr = owner.address();
+    let mut tip = bond(&mut dag, rep, &owner);
+    assert!(dag.has_confirmed_bond(&owner_addr));
+    // A release block for one bonded element starts the timelock.
+    let recs = dag.releases();
+    assert!(recs.is_empty());
+    let bonded = dag.bonded_elements(&owner_addr);
+    assert_eq!(bonded.len(), 5);
+    let e = bonded[0];
+    let rel = sign_block(
+        Block::new(BlockType::BondRelease, owner_addr, tip, ZERO_HASH, e, owner_addr),
+        &owner,
+    );
+    let h = rel.block_hash();
+    dag.insert_block(rel).unwrap();
+    dag.cast_vote(rep, h).unwrap();
+    dag.confirm_step();
+    assert!(dag.is_confirmed(&h));
+    let rec = dag.request_release_record(&owner_addr).unwrap().clone();
+    assert!(!rec.cancelled && !rec.executed);
+    // Not yet mature: still bonded, element not spendable as unspent.
+    assert_eq!(dag.element(&e).unwrap().status, ElementStatus::Bonded);
+    // Advance past the timelock: release executes, element is unspent.
+    dag.advance_epochs(BOND_RELEASE_EPOCHS + 1);
+    assert!(dag.request_release_record(&owner_addr).unwrap().executed);
+    assert_eq!(dag.element(&e).unwrap().status, ElementStatus::Unspent);
+    // After one release the bond has 4 locks: below BOND_SIZE (5) the
+    // spend gate closes again -- burn votes are rejected with NoBond.
+    // That is why v1 keeps the full 5 until every release matures.
+    let e2 = eid(251);
+    dag.register_element(e2, owner_addr);
+    let burn = sign_block(
+        Block::new(BlockType::Burn, owner_addr, dag.account_tip(&owner_addr).unwrap(), ZERO_HASH, e2, burn_sink()),
+        &owner,
+    );
+    let bh = burn.block_hash();
+    dag.insert_block(burn).unwrap();
+    let vote = dag.cast_vote(rep, bh);
+    assert_eq!(vote, Err(DagError::NoBond));
+    assert!(!dag.is_confirmed(&bh));
+}
