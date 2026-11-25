@@ -284,6 +284,27 @@ fn mask_stream(shared: &[u8], len: usize) -> Vec<u8> {
     out
 }
 
+/// `CryptoRng` over the OS entropy source (for KEM encapsulation).
+pub struct OsEntropy;
+impl rand_core::TryCryptoRng for OsEntropy {}
+impl rand_core::TryRng for OsEntropy {
+    type Error = core::convert::Infallible;
+    fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+        let mut b = [0u8; 4];
+        self.try_fill_bytes(&mut b).unwrap();
+        Ok(u32::from_le_bytes(b))
+    }
+    fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
+        let mut b = [0u8; 8];
+        self.try_fill_bytes(&mut b).unwrap();
+        Ok(u64::from_le_bytes(b))
+    }
+    fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), Self::Error> {
+        getrandom::fill(dest).expect("OS entropy");
+        Ok(())
+    }
+}
+
 /// Encrypt a 32-byte wallet seed to an ML-KEM-768 encapsulation key.
 pub fn seed_backup_encrypt(
     encapsulation_key: &[u8],
@@ -297,15 +318,13 @@ pub fn seed_backup_encrypt(
         };
     let ek = EncapsulationKey::<ml_kem::MlKem768>::new(&ek_arr)
         .map_err(|_| WalletError::BadKeyLength)?;
-    // Deterministic encapsulation randomness derived from key+seed keeps
-    // tests reproducible; production callers may randomize via encapsulate().
-    let mut mh = Sha3_256::new();
-    mh.update(b"turn-dag-mlkem-encap");
-    mh.update(encapsulation_key);
-    mh.update(seed);
-    let digest: [u8; 32] = mh.finalize().into();
-    let m: ml_kem::B32 = ml_kem::array::Array::from(digest);
-    let (ct, shared) = ek.encapsulate_deterministic(&m);
+    // True-random encapsulation: deriving the KEM randomness from
+    // (key, seed) would make the ciphertext publicly recomputable,
+    // breaking backup confidentiality completely.
+    use ml_kem::Encapsulate;
+    // CryptoRng (rand_core 0.10) over the OS entropy source.
+    let mut rng = OsEntropy;
+    let (ct, shared) = ek.encapsulate_with_rng(&mut rng);
     let stream = mask_stream(shared.as_slice(), 32);
     let masked: Vec<u8> = seed.iter().zip(stream.iter()).map(|(a, b)| a ^ b).collect();
     let mut h = Sha3_256::new();

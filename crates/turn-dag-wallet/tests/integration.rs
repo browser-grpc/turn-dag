@@ -72,3 +72,24 @@ fn address_errors() {
     assert!(PqAddress::from_bech32("not-bech32").is_err());
     assert!(PqAddress::from_bech32("turn1qqqqqqqq").is_err());
 }
+
+#[test]
+fn seed_backup_randomized_not_recomputable() {
+    // True-random encapsulation: the same (key, seed) encrypts to
+    // different blobs, so a key holder cannot recompute the ciphertext.
+    let kem = KemKeypair::generate(&[11u8; 32]);
+    let a = seed_backup_encrypt(kem.encapsulation_key(), &[42u8; 32]).unwrap();
+    let b = seed_backup_encrypt(kem.encapsulation_key(), &[42u8; 32]).unwrap();
+    assert_ne!(a, b, "encapsulation must be randomized");
+    assert_eq!(kem.decrypt_seed(&a).unwrap(), [42u8; 32]);
+    assert_eq!(kem.decrypt_seed(&b).unwrap(), [42u8; 32]);
+}
+
+#[test]
+fn kem_keypair_is_deterministic_from_seed() {
+    let a = KemKeypair::generate(&[12u8; 32]);
+    let b = KemKeypair::generate(&[12u8; 32]);
+    assert_eq!(a.encapsulation_key(), b.encapsulation_key());
+    let c = KemKeypair::generate(&[13u8; 32]);
+    assert_ne!(a.encapsulation_key(), c.encapsulation_key());
+}
