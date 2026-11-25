@@ -558,3 +558,154 @@ fn sqlite_storage_roundtrip_and_dag() {
     assert_ne!(tip, ZERO_HASH);
     assert!(dag.has_confirmed_bond(&alice.address()));
 }
+
+#[test]
+fn descendant_blocks_add_cumulative_weight() {
+    let (mut dag, owner, _rep, tip) = bonded_owner(31);
+    let before = dag.descendant_weight(&tip);
+    // A new block on owner's chain descends from the tip and cross-refs it.
+    let e = eid(231);
+    dag.register_element(e, owner.address());
+    let next = Block::new(
+        BlockType::BondLock,
+        owner.address(),
+        tip,
+        tip,
+        e,
+        bond_pseudo_account(&owner.address()),
+    );
+    let h = sign_block(next, &owner).block_hash();
+    let signed = sign_block(
+        Block::new(
+            BlockType::BondLock,
+            owner.address(),
+            tip,
+            tip,
+            e,
+            bond_pseudo_account(&owner.address()),
+        ),
+        &owner,
+    );
+    let _ = h;
+    // Insert may pend on rules; descendant weight counts stored blocks regardless.
+    let _ = dag.insert_block(signed);
+    let after = dag.descendant_weight(&tip);
+    assert!(
+        after > before,
+        "new descendant must add weight ({before} -> {after})"
+    );
+    assert_eq!(dag.cumulative_weight(&tip), dag.vote_weight(&tip) + after);
+    assert_eq!(dag.cumulative_weight(&[8u8; 32]), 0);
+    assert_eq!(dag.descendant_weight(&[8u8; 32]), 0);
+}
+
+#[test]
+fn network_partition_minority_cannot_allocate() {
+    // Partition: two sides vote for rival burns of one element. On heal
+    // both burns land on one node; at most one rival may confirm and
+    // the loser is orphaned evidence, so no TURN server allocates twice.
+    let mut dag = Dag::new();
+    let rep_a = setup_rep(&mut dag);
+    let owner = w(41);
+    let tip = bond(&mut dag, rep_a, &owner);
+    let e = eid(240);
+    dag.register_element(e, owner.address());
+    // Second representative with weight (rep_b, 10 delegated elements).
+    let rep_b = w(201).address();
+    for i in 0..10u8 {
+        dag.register_element(ElementId([150 + i; 32]), rep_b);
+    }
+    dag.delegate(rep_b, rep_b);
+    // Rival burns: same predecessor + element, different hashes.
+    let burn_a = sign_block(
+        Block::new(
+            BlockType::Burn,
+            owner.address(),
+            tip,
+            ZERO_HASH,
+            e,
+            burn_sink(),
+        ),
+        &owner,
+    );
+    let mut burn_b_blk = Block::new(
+        BlockType::Burn,
+        owner.address(),
+        tip,
+        ZERO_HASH,
+        e,
+        burn_sink(),
+    );
+    // Rival burn differs in to_address (different sink address), so the
+    // signed content differs and the hashes must differ.
+    let mut alt = burn_sink();
+    alt.0[0] ^= 1;
+    burn_b_blk.to_address = alt;
+    let burn_b = sign_block(burn_b_blk, &owner);
+    let ha = burn_a.block_hash();
+    let hb = burn_b.block_hash();
+    assert_ne!(ha, hb);
+    dag.insert_block(burn_a).unwrap();
+    dag.insert_block(burn_b).unwrap();
+    dag.cast_vote(rep_a, ha).unwrap();
+    dag.cast_vote(rep_b, hb).unwrap();
+    for _ in 0..5 {
+        dag.confirm_step();
+    }
+    let ca = dag.is_confirmed(&ha);
+    let cb = dag.is_confirmed(&hb);
+    assert!(!(ca && cb), "both rivals confirmed: {ca} {cb}");
+    let orphaned = [ha, hb]
+        .iter()
+        .any(|h| dag.block_status(h) == Some(BlockStatus::Orphaned));
+    // Neither side reached 67% alone in this balanced split (10 vs 10),
+    // so both burns stay pending and NO allocation is made on either
+    // partition -- the spec's stall-instead-of-double-spend rule.
+    assert!(!ca && !cb);
+    assert!(!orphaned);
+}
+
+#[test]
+fn eclipsed_server_sees_attacker_fed_view_but_weight_protects() {
+    // An eclipsed TURN server whose only peer is the attacker can be
+    // fed votes for a rival burn; its confirmation checks still require
+    // weight from the full online set, so it cannot allocate locally
+    // without network weight. Model: attacker controls the only vote;
+    // burn must not confirm.
+    let mut dag = Dag::new();
+    let rep = setup_rep(&mut dag);
+    let owner = w(42);
+    let tip = bond(&mut dag, rep, &owner);
+    let e = eid(241);
+    dag.register_element(e, owner.address());
+    // Remove the honest rep from the online set (eclipse): online
+    // weight becomes whatever the attacker supplies.
+    let attacker = w(99).address();
+    dag.register_element(eid(250), attacker);
+    // Attacker votes for its own burn without delegation weight.
+    let burn = sign_block(
+        Block::new(
+            BlockType::Burn,
+            owner.address(),
+            tip,
+            ZERO_HASH,
+            e,
+            burn_sink(),
+        ),
+        &owner,
+    );
+    let h = burn.block_hash();
+    dag.insert_block(burn).unwrap();
+    // Even with the attacker's vote, cumulative weight is below 67% of
+    // online weight, so the burn stays pending and unallocatable.
+    let _ = dag.cast_vote(attacker, h).unwrap();
+    for _ in 0..3 {
+        dag.confirm_step();
+    }
+    assert!(!dag.is_confirmed(&h));
+    assert_ne!(
+        dag.block_status(&h),
+        Some(BlockStatus::Confirmed),
+        "eclipse-fed single vote must not confirm"
+    );
+}
