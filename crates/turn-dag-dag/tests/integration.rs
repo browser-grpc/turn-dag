@@ -728,7 +728,14 @@ fn release_timelock_to_rendezvous_story() {
     assert_eq!(bonded.len(), 5);
     let e = bonded[0];
     let rel = sign_block(
-        Block::new(BlockType::BondRelease, owner_addr, tip, ZERO_HASH, e, owner_addr),
+        Block::new(
+            BlockType::BondRelease,
+            owner_addr,
+            tip,
+            ZERO_HASH,
+            e,
+            owner_addr,
+        ),
         &owner,
     );
     let h = rel.block_hash();
@@ -750,7 +757,14 @@ fn release_timelock_to_rendezvous_story() {
     let e2 = eid(251);
     dag.register_element(e2, owner_addr);
     let burn = sign_block(
-        Block::new(BlockType::Burn, owner_addr, dag.account_tip(&owner_addr).unwrap(), ZERO_HASH, e2, burn_sink()),
+        Block::new(
+            BlockType::Burn,
+            owner_addr,
+            dag.account_tip(&owner_addr).unwrap(),
+            ZERO_HASH,
+            e2,
+            burn_sink(),
+        ),
         &owner,
     );
     let bh = burn.block_hash();
