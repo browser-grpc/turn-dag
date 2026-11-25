@@ -1,9 +1,6 @@
 #!/bin/sh
+# Thin host wrapper only — all logic is in the Dockerfile (test stage runs at image build).
 set -eu
-echo "== test =="
-test -f docs/bond-contract-fraud-proof-spec.pdf
-test -s docs/bond-contract-fraud-proof-spec.pdf
-file docs/bond-contract-fraud-proof-spec.pdf | grep -qi pdf
-grep -q "Bond Contract" README.md
-grep -q "Apache" LICENSE
-echo "spec checks: PASS"
+cd "$(dirname "$0")/.."
+docker build --target test -t turn-dag:test .
+echo "test: PASS (via Dockerfile test stage)"

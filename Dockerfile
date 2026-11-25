@@ -1,76 +1,54 @@
 # syntax=docker/dockerfile:1
-# turn-dag — all build/test/tool/run/ci concerns live in this file.
-# No host tooling required beyond Docker. Use:
+# turn-dag — ALL build/test/tool/run/ci logic lives in this file.
+# No host tooling beyond Docker. No build/test logic in scripts/ or CI YAML:
+# scripts/*.sh are thin `docker build`/`docker run` wrappers only.
 #   docker build -t turn-dag .
-#   docker run --rm turn-dag test
-#   docker run --rm turn-dag build
+#   docker run --rm turn-dag test|build|ci|run
 #   docker run --rm -it turn-dag tool
-#   docker run --rm turn-dag run
-#   docker run --rm turn-dag ci
+#   docker build --target ci -t turn-dag:ci .
+ARG RUST_VERSION=1.87
 
-ARG RUST_VERSION=1.85
-ARG NODE_VERSION=22
-ARG PYTHON_VERSION=3.12
-
-# ---------- base: tools ----------
+# ---------- base: Rust toolchain only (no Node/Python runtimes) ----------
 FROM rust:${RUST_VERSION}-bookworm AS base
-ARG NODE_VERSION
-ARG PYTHON_VERSION
-ENV DEBIAN_FRONTEND=noninteractive \
-    CARGO_TERM_COLOR=never
+ENV DEBIAN_FRONTEND=noninteractive CARGO_TERM_COLOR=never
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl git jq python3 python3-pip \
-    poppler-utils file make pkg-config libssl-dev \
-    nodejs npm \
+    ca-certificates git file \
     && rm -rf /var/lib/apt/lists/*
-# Pin Node via nodesource only if needed; Debian node is a fallback.
-# Rust toolchain: smoltcp / ML-DSA / Argon2 crates build here.
-RUN rustup component add clippy rustfmt 2>/dev/null || true
+RUN rustup component add clippy rustfmt
 WORKDIR /work
 COPY . /work
+RUN chmod +x scripts/*.sh
 
 # ---------- build ----------
 FROM base AS build
-# Build = validate the spec artifact and produce a build report.
-# Future code: `cargo build --release` goes here, behind the same target.
-RUN ./scripts/build.sh 2>/dev/null || \
-    (echo "== build ==" && \
-     test -f docs/bond-contract-fraud-proof-spec.pdf && \
-     pdfinfo docs/bond-contract-fraud-proof-spec.pdf | head -20 && \
-     ls -lh docs/ README.md LICENSE Dockerfile)
+RUN test -f docs/bond-contract-fraud-proof-spec.pdf \
+    && cargo build --workspace \
+    && cargo build --workspace --release -p turn-dag-node \
+    && echo "build: PASS"
 
-# ---------- test ----------
+# ---------- test (fmt + clippy + full test suite) ----------
 FROM build AS test
-# Test = spec checks + unit tests when code lands.
-# Future code: `cargo test --all` goes here.
-RUN ./scripts/test.sh 2>/dev/null || \
-    (echo "== test ==" && \
-     test -f docs/bond-contract-fraud-proof-spec.pdf && \
-     test -s docs/bond-contract-fraud-proof-spec.pdf && \
-     file docs/bond-contract-fraud-proof-spec.pdf | grep -qi pdf && \
-     grep -q "Bond Contract" README.md && \
-     grep -q "Apache" LICENSE && \
-     echo "spec checks: PASS")
+RUN test -s docs/bond-contract-fraud-proof-spec.pdf \
+    && grep -q "Apache" LICENSE \
+    && cargo fmt --all -- --check \
+    && cargo clippy --workspace --all-targets -- -D warnings \
+    && cargo test --workspace \
+    && echo "test: PASS"
 
-# ---------- tool ----------
+# ---------- tool (interactive dev shell) ----------
 FROM base AS tool
-# Tool = interactive dev shell, all tools in-image, no host installs.
-# Usage: docker run --rm -it turn-dag tool
 ENTRYPOINT ["/bin/bash"]
 
-# ---------- run ----------
+# ---------- run (node binary; arg dispatch in scripts/entrypoint.sh) ----------
 FROM base AS run
-# Run = default runtime. Spec-only for now: print the spec summary.
-# Future code: replace CMD with the TURN / DAG node binary.
-CMD ["bash", "-c", "echo 'turn-dag: spec only, no server yet'; ls -R docs; echo 'See docs/bond-contract-fraud-proof-spec.pdf'"]
+RUN cargo build --release -p turn-dag-node \
+    && cp target/release/turn-dag-node /usr/local/bin/turn-dag-node
+ENTRYPOINT ["./scripts/entrypoint.sh"]
+CMD ["run"]
 
-# ---------- ci ----------
+# ---------- ci = build + test, nothing else ----------
 FROM test AS ci
-# CI = build + test, in one image, no host CI tooling.
-# Usage in GitHub Actions: docker build --target ci -t turn-dag:ci .
-# GitHub Actions should only do: checkout, docker build, docker run.
-# All lint / test / build logic lives in this Dockerfile + scripts/.
-RUN echo "== ci ==" && echo "build+test: PASS"
+RUN echo "== ci == build+test: PASS"
 
-# Default target is run, so `docker build -t turn-dag .` gives a runnable image.
+# Default target: runnable node image.
 FROM run AS final
