@@ -411,3 +411,102 @@ fn cli_keygen_backup_recover_roundtrip() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn burn_gate_end_to_end_cli_ticket_to_wire() {
+    // Node flow: bond + mint + burn (confirmed on the DAG) -> rendezvous
+    // ticket. The wire server accepts only that ticket; a forged ticket
+    // with valid HMAC but no confirmed burn gets 401.
+    use turn_dag_turn::wire::attr_type;
+    use turn_dag_turn::wire::Class;
+    use turn_dag_turn::wire::StunMessage;
+    use turn_dag_turn::wire::{method, HandleOutcome, TurnServer};
+    let mut node = Node::new("gate-node", 51);
+    let rep = node.rep;
+    let owner = wallet(51);
+    bond(&mut node.dag, rep, &owner).unwrap();
+    let (eid, _) = mint_one(&mut node.dag, rep, &owner, 1, 1_000).unwrap();
+    let tip = node
+        .dag
+        .account_tip(&owner.address())
+        .unwrap_or(turn_dag_dag::ZERO_HASH);
+    let burn = turn_dag_dag::sign_block(
+        turn_dag_dag::Block::new(
+            turn_dag_dag::BlockType::Burn,
+            owner.address(),
+            tip,
+            turn_dag_dag::ZERO_HASH,
+            eid,
+            turn_dag_dag::burn_sink(),
+        ),
+        &owner,
+    );
+    let burn_h = burn.block_hash();
+    confirm_on(&mut node.dag, rep, burn).unwrap();
+    assert!(node.dag.is_confirmed(&burn_h));
+    let secret = b"gate-issuer-secret".to_vec();
+    // Ticket minted ONLY after confirmation (rendezvous() gates on it).
+    let cred = rendezvous(
+        &node.dag,
+        secret.clone(),
+        burn_h,
+        "gate-user",
+        "203.0.113.5".parse().unwrap(),
+        "8.8.8.8".parse().unwrap(),
+        2_000,
+    )
+    .unwrap();
+    // Wire server with the confirmed-burn ticket registry.
+    let mut srv = TurnServer::new("127.0.0.1".parse().unwrap())
+        .with_rest_auth(secret.clone())
+        .with_burn_tickets(vec![cred.ticket_id.clone()]);
+    let nonce = "gate-nonce";
+    let _ = nonce;
+    // Allocate with the real ticket: succeeds.
+    let req = {
+        let mut m = StunMessage::new(method::ALLOCATE, Class::Request, [5u8; 12]);
+        m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+        m.push_attr(attr_type::USERNAME, cred.username.as_bytes().to_vec());
+        m.push_attr(attr_type::REALM, b"turn-dag".to_vec());
+        m.push_attr(attr_type::NONCE, b"gate-nonce".to_vec());
+        turn_dag_turn::wire::sign_wire(
+            m,
+            Some(&turn_dag_turn::wire::integrity_key(
+                &cred.username,
+                "turn-dag",
+                &cred.password,
+            )),
+        )
+    };
+    match srv.handle(&req, "203.0.113.5:5000".parse().unwrap(), 2_000) {
+        HandleOutcome::Response(b) => {
+            let r = StunMessage::decode(&b).unwrap();
+            assert_eq!(r.class, Class::Success);
+        }
+        other => panic!("ticketed allocate must succeed, got {other:?}"),
+    }
+    // Unconfirmed-burn ticket (forged ticket id, valid HMAC): 401.
+    let forged = {
+        let mut m = StunMessage::new(method::ALLOCATE, Class::Request, [5u8; 12]);
+        m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+        m.push_attr(attr_type::USERNAME, b"2120:pow:forged-ticket".to_vec());
+        m.push_attr(attr_type::REALM, b"turn-dag".to_vec());
+        m.push_attr(attr_type::NONCE, b"gate-nonce".to_vec());
+        let pass = turn_dag_turn::credential_password(&secret, "2120:pow:forged-ticket");
+        turn_dag_turn::wire::sign_wire(
+            m,
+            Some(&turn_dag_turn::wire::integrity_key(
+                "2120:pow:forged-ticket",
+                "turn-dag",
+                &pass,
+            )),
+        )
+    };
+    match srv.handle(&forged, "203.0.113.5:5000".parse().unwrap(), 2_000) {
+        HandleOutcome::Response(b) => {
+            let r = StunMessage::decode(&b).unwrap();
+            assert_eq!(turn_dag_turn::wire::error_code(&r), Some(401));
+        }
+        other => panic!("forged ticket must 401, got {other:?}"),
+    }
+}

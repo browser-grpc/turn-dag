@@ -48,6 +48,7 @@ fn serve_udp(args: &[String]) -> i32 {
     let mut user: Option<String> = None;
     let mut pass: Option<String> = None;
     let mut rest_secret: Option<String> = None;
+    let mut burn_tickets: Vec<String> = Vec::new();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -56,6 +57,7 @@ fn serve_udp(args: &[String]) -> i32 {
             "--user" => user = it.next().cloned(),
             "--pass" => pass = it.next().cloned(),
             "--rest-secret" => rest_secret = it.next().cloned(),
+            "--ticket" => burn_tickets.push(it.next().cloned().unwrap_or_default()),
             _ => {
                 eprintln!("unknown serve-udp arg: {a}");
                 return 2;
@@ -74,11 +76,13 @@ fn serve_udp(args: &[String]) -> i32 {
         let secret = turn_dag_dag::hex_decode(&hex_secret).unwrap_or_default();
         // Issuer REST credentials (username=expiry:pow:<ticket>): the
         // long-term key derives from the issuer HMAC, as TurnIssuer
-        // issues them. Dev note: the burn-confirmation gate that
-        // precedes credential issuance still needs DAG state wired in
-        // (see TODO read-me), so REST auth alone is necessary but not
-        // yet sufficient for mainnet rendezvous.
+        // issues them. With --ticket, only tickets minted after a
+        // confirmed burn (TurnIssuer::handle_post_redeem) are accepted:
+        // the burn gate is the ticket registry.
         server = server.with_rest_auth(secret);
+        if !burn_tickets.is_empty() {
+            server = server.with_burn_tickets(burn_tickets);
+        }
     } else if let (Some(u), Some(p)) = (user, pass) {
         let mut creds = std::collections::HashMap::new();
         creds.insert(u, p);
@@ -296,6 +300,10 @@ fn flow(cmd: &str) -> i32 {
             println!(
                 "rendezvous: ticket={} username={} expires_at={} max_bps={} byte_cap={}",
                 c.ticket_id, c.username, c.expires_at, c.max_bps, c.byte_cap
+            );
+            println!(
+                "serve-udp: pass --rest-secret <issuer-secret-hex> --ticket {} to relay for this burn (ticket is valid only because the burn was confirmed)",
+                c.ticket_id
             );
             0
         }

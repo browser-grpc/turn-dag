@@ -362,6 +362,9 @@ pub struct TurnServer {
     /// `expiry:pow:<ticket>` and the long-term key derives from the
     /// issuer HMAC, exactly as TurnIssuer issues them.
     rest_secret: Option<Vec<u8>>,
+    /// Burn gate: when configured, REST tickets must be present here
+    /// (tickets are minted only after a confirmed burn).
+    burn_tickets: Option<std::collections::HashSet<String>>,
     nonce: String,
 }
 impl TurnServer {
@@ -375,6 +378,7 @@ impl TurnServer {
             realm: "turn-dag".into(),
             credentials: HashMap::new(),
             rest_secret: None,
+            burn_tickets: None,
             nonce: String::new(),
         }
     }
@@ -382,6 +386,9 @@ impl TurnServer {
     /// HMAC-SHA1 password) instead of static long-term credentials.
     pub fn with_rest_auth(mut self, secret: Vec<u8>) -> Self {
         self.rest_secret = Some(secret);
+        if self.burn_tickets.is_none() {
+            // Gate off by default; enable with burn tickets.
+        }
         self.nonce = format!("{:016x}", {
             use sha2::{Digest, Sha256};
             let mut h = Sha256::new();
@@ -389,6 +396,13 @@ impl TurnServer {
             h.update(self.realm.as_bytes());
             u64::from_be_bytes(h.finalize()[..8].try_into().unwrap())
         });
+        self
+    }
+    /// Enable the burn gate: REST tickets must have been minted after
+    /// a confirmed burn (issuer-side gate). The operator supplies the
+    /// ticket IDs issued by TurnIssuer::handle_post_redeem.
+    pub fn with_burn_tickets(mut self, tickets: Vec<String>) -> Self {
+        self.burn_tickets = Some(tickets.into_iter().collect());
         self
     }
     /// Enable long-term credential auth (401 challenge + integrity).
@@ -430,11 +444,17 @@ impl TurnServer {
             else {
                 return Err(self.challenge(msg));
             };
-            let Some((expiry, _ticket)) = crate::parse_username(user) else {
+            let Some((expiry, ticket)) = crate::parse_username(user) else {
                 return Err(self.challenge(msg));
             };
             if now > expiry {
                 return Err(self.challenge(msg));
+            }
+            // Burn gate: only tickets minted after a confirmed burn.
+            if let Some(allowed) = &self.burn_tickets {
+                if !allowed.contains(&ticket) {
+                    return Err(self.challenge(msg));
+                }
             }
             if let Some(key) = self.auth_key(msg) {
                 if verify_integrity(raw, &key) {
@@ -1035,6 +1055,63 @@ mod tests {
         let bad = sign_wire(other, Some(&integrity_key(&username, "turn-dag", "forged")));
         let out = s.handle(&bad, client(), now);
         assert_eq!(error_code(&decode_ok(out)), Some(401));
+    }
+    #[test]
+    fn burn_gate_allows_only_confirmed_tickets() {
+        // No gate: REST ticket works.
+        let secret = b"issuer-secret".to_vec();
+        let username = "1120:pow:ticket-9";
+        let password = crate::credential_password(&secret, username);
+        let build = |tickets: Option<Vec<String>>| {
+            let mut s =
+                TurnServer::new("127.0.0.1".parse().unwrap()).with_rest_auth(secret.clone());
+            if let Some(t) = tickets {
+                s = s.with_burn_tickets(t);
+            }
+            s
+        };
+        let signed = |s: &TurnServer, user: &str, pass: &str| {
+            let mut m = StunMessage::new(method::ALLOCATE, Class::Request, txn());
+            m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+            m.push_attr(attr_type::USERNAME, user.as_bytes().to_vec());
+            m.push_attr(attr_type::REALM, b"turn-dag".to_vec());
+            m.push_attr(attr_type::NONCE, s_nonces(s, user).as_bytes().to_vec());
+            sign_wire(m, Some(&integrity_key(user, "turn-dag", pass)))
+        };
+        fn s_nonces(s: &TurnServer, _u: &str) -> String {
+            // nonce is derived from server_ip + realm; recompute identically.
+            format!("{:016x}", {
+                use sha2::{Digest, Sha256};
+                let mut h = Sha256::new();
+                h.update(s.server_ip.to_string().as_bytes());
+                h.update(s.realm.as_bytes());
+                u64::from_be_bytes(h.finalize()[..8].try_into().unwrap())
+            })
+        }
+        // Ungated: succeeds.
+        let mut open = build(None);
+        let raw = signed(&open, username, &password);
+        assert!(matches!(
+            open.handle(&raw, client(), 1000),
+            HandleOutcome::Response(_)
+        ));
+        // Gated, ticket NOT in set (unconfirmed burn): 401.
+        let mut gated = build(Some(vec!["other-ticket".into()]));
+        let raw = signed(&gated, username, &password);
+        assert_eq!(
+            error_code(&decode_ok(gated.handle(&raw, client(), 1000))),
+            Some(401)
+        );
+        // Gated, ticket IS in set (confirmed burn): proceeds.
+        let mut gated2 = build(Some(vec!["ticket-9".into()]));
+        let raw = signed(&gated2, username, &password);
+        match gated2.handle(&raw, client(), 1000) {
+            HandleOutcome::Response(b) => {
+                let r = StunMessage::decode(&b).unwrap();
+                assert_eq!(r.class, Class::Success);
+            }
+            other => panic!("expected success, got {other:?}"),
+        }
     }
     fn auth_server() -> TurnServer {
         let mut creds = std::collections::HashMap::new();
