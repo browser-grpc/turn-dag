@@ -1,0 +1,11 @@
+[package]
+name = "turn-dag-element"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace = true
+sha3.workspace = true
+turn-dag-wallet = { path = "../turn-dag-wallet" }

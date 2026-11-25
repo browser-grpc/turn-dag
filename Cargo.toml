@@ -1,0 +1,15 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/turn-dag-element",
+    "crates/turn-dag-wallet",
+]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+sha2 = "0.10"
+sha3 = "0.10"
