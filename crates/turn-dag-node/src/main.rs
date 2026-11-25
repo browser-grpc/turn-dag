@@ -16,6 +16,7 @@ USAGE:
   turn-dag-node rendezvous
   turn-dag-node demo
   turn-dag-node stack
+  turn-dag-node serve-udp [--addr 127.0.0.1:3478] [--relay-ip IP] [--user USER --pass PASS]
 Commands demonstrate node init/status, mint, transfer and the
 burn-for-rendezvous flow in-process on a virtual/smoltcp device or
 pure logic. No listener is opened.";
@@ -23,7 +24,62 @@ pure logic. No listener is opened.";
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("demo");
+    if cmd == "serve-udp" {
+        std::process::exit(serve_udp(&args[2..]));
+    }
     std::process::exit(run(cmd));
+}
+
+fn serve_udp(args: &[String]) -> i32 {
+    let mut addr = "127.0.0.1:3478".to_string();
+    let mut relay_ip: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut pass: Option<String> = None;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--addr" => addr = it.next().cloned().unwrap_or_default(),
+            "--relay-ip" => relay_ip = it.next().cloned(),
+            "--user" => user = it.next().cloned(),
+            "--pass" => pass = it.next().cloned(),
+            _ => {
+                eprintln!("unknown serve-udp arg: {a}");
+                return 2;
+            }
+        }
+    }
+    let Ok(sock_addr) = addr.parse::<std::net::SocketAddr>() else {
+        eprintln!("bad --addr: {addr}");
+        return 2;
+    };
+    let relay: std::net::IpAddr = relay_ip
+        .and_then(|r| r.parse().ok())
+        .unwrap_or(sock_addr.ip());
+    let mut server = turn_dag_turn::wire::TurnServer::new(relay);
+    if let (Some(u), Some(p)) = (user, pass) {
+        let mut creds = std::collections::HashMap::new();
+        creds.insert(u, p);
+        server = server.with_auth("turn-dag", creds);
+    }
+    let mut live = match turn_dag_turn::live::LiveUdpTurnServer::bind(sock_addr, server) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("bind {addr} failed: {e}");
+            return 1;
+        }
+    };
+    println!(
+        "turn-udp listening addr={} auth={}",
+        live.local_addr().map(|a| a.to_string()).unwrap_or_default(),
+        live.allocation_count()
+    );
+    // Serve until killed (Ctrl-C / SIGTERM). UDP only; no kernel TCP.
+    loop {
+        if let Err(e) = live.serve_once() {
+            eprintln!("serve error: {e}");
+            return 1;
+        }
+    }
 }
 
 fn run(cmd: &str) -> i32 {
