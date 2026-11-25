@@ -4,6 +4,7 @@ members = [
     "crates/turn-dag-element",
     "crates/turn-dag-wallet",
     "crates/turn-dag-dag",
+    "crates/turn-dag-minter",
 ]
 
 [workspace.package]
