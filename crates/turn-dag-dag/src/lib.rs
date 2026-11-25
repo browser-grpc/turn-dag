@@ -193,7 +193,7 @@ pub fn hex_encode(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
-    if s.len() % 2 != 0 {
+    if !s.is_ascii() || s.len() % 2 != 0 {
         return None;
     }
     (0..s.len())
@@ -968,7 +968,9 @@ impl<S: Storage> Dag<S> {
             .map(|s| s.contains(rep))
             .unwrap_or(false)
     }
-    pub fn cumulative_weight(&self, block_hash: &[u8; 32]) -> u64 {
+    /// Weight from representatives voting for this branch, excluding
+    /// equivocators (spec 3.2).
+    pub fn vote_weight(&self, block_hash: &[u8; 32]) -> u64 {
         let Some(signed) = self.storage.get(block_hash) else {
             return 0;
         };
@@ -982,6 +984,43 @@ impl<S: Storage> Dag<S> {
             .filter(|(rep, h)| *h == block_hash && !eq.map(|s| s.contains(rep)).unwrap_or(false))
             .map(|(rep, _)| self.representative_weight(rep))
             .sum()
+    }
+    /// Weight a block accrues from later blocks that reference it,
+    /// directly or through descendants (spec 3.2.3): each descendant
+    /// contributes its account's confirmed unspent+bonded weight once.
+    pub fn descendant_weight(&self, block_hash: &[u8; 32]) -> u64 {
+        // Reverse edges: parent hash -> hashes of blocks naming it as
+        // previous or link_parent.
+        let mut children: HashMap<[u8; 32], Vec<[u8; 32]>> = HashMap::new();
+        for h in self.storage.hashes() {
+            if let Some(s) = self.storage.get(&h) {
+                for parent in [s.block.previous, s.block.link_parent] {
+                    if parent != ZERO_HASH {
+                        children.entry(parent).or_default().push(h);
+                    }
+                }
+            }
+        }
+        let mut seen: HashSet<[u8; 32]> = HashSet::new();
+        let mut stack = vec![*block_hash];
+        let mut total = 0u64;
+        while let Some(cur) = stack.pop() {
+            if let Some(kids) = children.get(&cur) {
+                for k in kids {
+                    if seen.insert(*k) {
+                        if let Some(s) = self.storage.get(k) {
+                            total += self.account_weight(&s.block.account);
+                        }
+                        stack.push(*k);
+                    }
+                }
+            }
+        }
+        total
+    }
+    /// Spec 3.2.3: vote weight plus descendant-block weight.
+    pub fn cumulative_weight(&self, block_hash: &[u8; 32]) -> u64 {
+        self.vote_weight(block_hash) + self.descendant_weight(block_hash)
     }
     /// One deterministic 5s vote-epoch tick; no sleeps.
     pub fn confirm_step(&mut self) {
