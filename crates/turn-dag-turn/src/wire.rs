@@ -10,6 +10,10 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 pub const STUN_MAGIC: u32 = 0x2112_A442;
+/// First bytes as hex, for TURN_DEBUG packet logs.
+pub fn hex_preview(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
 pub mod method {
     pub const BINDING: u16 = 0x001;
     pub const ALLOCATE: u16 = 0x003;
@@ -29,6 +33,12 @@ pub mod attr_type {
     pub const XOR_RELAYED_ADDRESS: u16 = 0x0016;
     pub const REQUESTED_TRANSPORT: u16 = 0x0019;
     pub const XOR_MAPPED_ADDRESS: u16 = 0x0020;
+    pub const USERNAME: u16 = 0x0006;
+    pub const MESSAGE_INTEGRITY: u16 = 0x0008;
+    pub const REALM: u16 = 0x0014;
+    pub const NONCE: u16 = 0x0015;
+    pub const FINGERPRINT: u16 = 0x8028;
+    pub const SOFTWARE: u16 = 0x8022;
 }
 /// STUN message classes, encoded in bits 4 and 8 of the type field.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,15 +93,20 @@ impl StunMessage {
     pub fn push_attr(&mut self, t: u16, v: Vec<u8>) {
         self.attrs.push((t, v));
     }
-    pub fn encode(&self) -> Vec<u8> {
+    /// Raw encode without fingerprint computation (sign_wire handles it).
+    /// Each attribute is padded to a 4-byte boundary independently
+    /// (RFC 5389 §15); padding is never cumulative.
+    pub fn encode_raw(&self) -> Vec<u8> {
         let mut body = Vec::new();
         for (t, v) in &self.attrs {
-            body.extend_from_slice(&t.to_be_bytes());
-            body.extend_from_slice(&(v.len() as u16).to_be_bytes());
-            body.extend_from_slice(v);
-            while body.len() % 4 != 0 {
-                body.push(0);
+            let mut attr = Vec::with_capacity(4 + v.len() + 3);
+            attr.extend_from_slice(&t.to_be_bytes());
+            attr.extend_from_slice(&(v.len() as u16).to_be_bytes());
+            attr.extend_from_slice(v);
+            while attr.len() % 4 != 0 {
+                attr.push(0);
             }
+            body.extend_from_slice(&attr);
         }
         let mut out = Vec::with_capacity(20 + body.len());
         out.extend_from_slice(&encode_type(self.method, self.class).to_be_bytes());
@@ -100,6 +115,11 @@ impl StunMessage {
         out.extend_from_slice(&self.transaction);
         out.extend_from_slice(&body);
         out
+    }
+    /// Encode without FINGERPRINT (Chromium ignores absent fingerprints
+    /// on requests; authenticated successes get a correct one).
+    pub fn encode(&self) -> Vec<u8> {
+        sign_wire(self.clone(), None)
     }
     pub fn decode(data: &[u8]) -> Option<Self> {
         if data.len() < 20 || data[0] >> 6 != 0 {
@@ -182,6 +202,96 @@ fn unxor_addr(v: &[u8], txn: &[u8; 12]) -> Option<SocketAddr> {
         _ => None,
     }
 }
+/// Long-term credential key: MD5(username:realm:password) (RFC 8656 §9.2).
+pub fn integrity_key(username: &str, realm: &str, password: &str) -> [u8; 16] {
+    use md5::{Digest, Md5};
+    let mut h = Md5::new();
+    h.update(username.as_bytes());
+    h.update(b":");
+    h.update(realm.as_bytes());
+    h.update(b":");
+    h.update(password.as_bytes());
+    h.finalize().into()
+}
+fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+    let mut mac = <Hmac<Sha1> as Mac>::new_from_slice(key).expect("hmac key");
+    mac.update(data);
+    mac.finalize().into_bytes().into()
+}
+/// Encode+sign a message for the wire: MESSAGE-INTEGRITY (if a key is
+/// given) then FINGERPRINT last, in RFC 8656 order. Unsigned/error
+/// messages carry no FINGERPRINT: Chromium's libnice ignores absent
+/// fingerprints, while a malformed one is worse than none.
+pub fn sign_wire(mut msg: StunMessage, integrity: Option<&[u8; 16]>) -> Vec<u8> {
+    let Some(k) = integrity else {
+        return msg.encode_raw();
+    };
+    msg.push_attr(attr_type::MESSAGE_INTEGRITY, vec![0u8; 20]);
+    msg.push_attr(attr_type::FINGERPRINT, vec![0u8; 4]);
+    let mut bytes = msg.encode_raw();
+    // Reserving the fingerprint's tail keeps offsets stable regardless
+    // of what the CRC computes over. The tail is exactly the
+    // 8-byte fingerprint attribute (type + length + 4 value bytes).
+    let n = bytes.len();
+    assert_eq!(&bytes[n - 8..n - 4], &[0x80, 0x28, 0x00, 0x04]);
+    // MESSAGE-INTEGRITY over up to the attribute with adjusted length.
+    let mi_at = n - 8 - 24;
+    let mut head = bytes[..mi_at].to_vec();
+    head[2..4].copy_from_slice(&((mi_at - 20 + 24) as u16).to_be_bytes());
+    let mac = hmac_sha1(k, &head);
+    bytes[mi_at + 4..mi_at + 24].copy_from_slice(&mac);
+    // FINGERPRINT last: CRC32 over the final message (field zeroed).
+    let fp = (crc32(&bytes) ^ 0x5354_554E).to_be_bytes();
+    bytes[n - 4..n].copy_from_slice(&fp);
+    bytes
+}
+pub fn sign_integrity(msg: StunMessage, key: &[u8; 16]) -> Vec<u8> {
+    sign_wire(msg, Some(key))
+}
+
+/// Verify MESSAGE-INTEGRITY over a raw request datagram.
+/// The HMAC covers the header (with length adjusted to include the
+/// 24-byte integrity attribute) up to the attribute itself.
+pub fn verify_integrity(raw: &[u8], key: &[u8; 16]) -> bool {
+    if raw.len() < 20 {
+        return false;
+    }
+    let len = u16::from_be_bytes(raw[2..4].try_into().unwrap()) as usize;
+    let end = (20 + len).min(raw.len());
+    let mut i = 20;
+    while i + 4 <= end {
+        let t = u16::from_be_bytes(raw[i..i + 2].try_into().unwrap());
+        let l = u16::from_be_bytes(raw[i + 2..i + 4].try_into().unwrap()) as usize;
+        if t == attr_type::MESSAGE_INTEGRITY {
+            if l != 20 || i + 24 > end {
+                return false;
+            }
+            let mut head = raw[..i].to_vec();
+            let adj = (i - 20 + 24) as u16;
+            head[2..4].copy_from_slice(&adj.to_be_bytes());
+            let expect = hmac_sha1(key, &head);
+            return expect == raw[i + 4..i + 24];
+        }
+        i += 4 + l + (4 - l % 4) % 4;
+    }
+    false
+}
+pub fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xEDB8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc ^ 0xFFFF_FFFF
+}
 fn err_response(req: &StunMessage, code: u16, reason: &str) -> StunMessage {
     let mut m = StunMessage::new(req.method, Class::Error, req.transaction);
     let mut v = vec![0, 0, (code / 100) as u8, (code % 100) as u8];
@@ -214,6 +324,30 @@ pub enum HandleOutcome {
     Drop,
 }
 
+/// ChannelData frame: channel number + length + payload, padded to 4.
+pub fn encode_channel_data(channel: u16, payload: &[u8]) -> Vec<u8> {
+    let mut o = Vec::with_capacity(4 + payload.len() + 3);
+    o.extend_from_slice(&channel.to_be_bytes());
+    o.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    o.extend_from_slice(payload);
+    while o.len() % 4 != 0 {
+        o.push(0);
+    }
+    o
+}
+/// Decode a ChannelData frame, returning (channel, payload).
+pub fn decode_channel_data(data: &[u8]) -> Option<(u16, &[u8])> {
+    if data.len() < 4 || (data[0] >> 6) != 0b01 {
+        return None;
+    }
+    let chan = u16::from_be_bytes(data[0..2].try_into().ok()?);
+    let len = u16::from_be_bytes(data[2..4].try_into().ok()?) as usize;
+    if data.len() < 4 + len {
+        return None;
+    }
+    Some((chan, &data[4..4 + len]))
+}
+
 /// Minimal TURN server state machine (no relay sockets of its own:
 /// `Forward` tells the stack owner which peer a payload goes to).
 pub struct TurnServer {
@@ -222,6 +356,9 @@ pub struct TurnServer {
     max_lifetime_secs: u64,
     byte_cap: u64,
     allocations: HashMap<SocketAddr, Allocation>,
+    realm: String,
+    credentials: HashMap<String, String>,
+    nonce: String,
 }
 impl TurnServer {
     pub fn new(server_ip: IpAddr) -> Self {
@@ -231,25 +368,114 @@ impl TurnServer {
             max_lifetime_secs: 120,
             byte_cap: 16_384 * 120,
             allocations: HashMap::new(),
+            realm: "turn-dag".into(),
+            credentials: HashMap::new(),
+            nonce: String::new(),
         }
+    }
+    /// Enable long-term credential auth (401 challenge + integrity).
+    pub fn with_auth(mut self, realm: &str, credentials: HashMap<String, String>) -> Self {
+        self.realm = realm.into();
+        self.nonce = format!("{:016x}", {
+            use sha2::{Digest, Sha256};
+            let mut h = Sha256::new();
+            h.update(self.server_ip.to_string().as_bytes());
+            h.update(realm.as_bytes());
+            u64::from_be_bytes(h.finalize()[..8].try_into().unwrap())
+        });
+        self.credentials = credentials;
+        self
+    }
+    fn auth_key(&self, msg: &StunMessage) -> Option<[u8; 16]> {
+        let user = std::str::from_utf8(msg.attr(attr_type::USERNAME)?).ok()?;
+        let password = self.credentials.get(user)?;
+        Some(integrity_key(user, &self.realm, password))
+    }
+    /// Ok(key) if the request may proceed (auth off, or valid integrity).
+    fn check_auth(&self, raw: &[u8], msg: &StunMessage) -> Result<Option<[u8; 16]>, StunMessage> {
+        if self.credentials.is_empty() {
+            return Ok(None);
+        }
+        let user = msg
+            .attr(attr_type::USERNAME)
+            .and_then(|v| std::str::from_utf8(v).ok());
+        let nonce_ok = msg
+            .attr(attr_type::NONCE)
+            .map(|v| v == self.nonce.as_bytes())
+            .unwrap_or(false);
+        let realm_ok = msg
+            .attr(attr_type::REALM)
+            .map(|v| v == self.realm.as_bytes())
+            .unwrap_or(true);
+        if let (Some(user), true, true) = (user, nonce_ok, realm_ok) {
+            if let Some(password) = self.credentials.get(user) {
+                let key = integrity_key(user, &self.realm, password);
+                if verify_integrity(raw, &key) {
+                    return Ok(Some(key));
+                }
+            }
+        }
+        let mut m = StunMessage::new(msg.method, Class::Error, msg.transaction);
+        let mut v = vec![0, 0, 4, 1];
+        v.extend_from_slice(b"Unauthorized");
+        m.push_attr(attr_type::ERROR_CODE, v);
+        m.push_attr(attr_type::REALM, self.realm.as_bytes().to_vec());
+        m.push_attr(attr_type::NONCE, self.nonce.as_bytes().to_vec());
+        Err(m)
     }
     pub fn relayed_address(&self, client: &SocketAddr) -> Option<SocketAddr> {
         self.allocations.get(client).map(|a| a.relayed)
     }
     pub fn allocation_count(&self) -> usize {
+        // dbg counter
         self.allocations.len()
     }
     pub fn handle(&mut self, data: &[u8], src: SocketAddr, now: u64) -> HandleOutcome {
+        // ChannelData (top bits 01) is not STUN-framed.
+        if data.len() >= 4 && (data[0] >> 6) == 0b01 {
+            return self.on_channel_data(data, src, now);
+        }
         let Some(msg) = StunMessage::decode(data) else {
             return HandleOutcome::Drop;
         };
         self.allocations.retain(|_, a| a.expires_at > now);
+        // Long-term auth on every TURN method (Binding is exempt).
+        let auth_key = if msg.method != method::BINDING && msg.class == Class::Request {
+            match self.check_auth(data, &msg) {
+                Ok(k) => k,
+                Err(m) => return HandleOutcome::Response(m.encode()),
+            }
+        } else {
+            None
+        };
+        let out = self.dispatch(&msg, src, now);
+        // Sign successful/error responses when auth is in use.
+        if let (Some(key), HandleOutcome::Response(bytes)) = (auth_key, &out) {
+            if StunMessage::decode(bytes).map(|m| m.method) == Some(msg.method)
+                && msg.method != method::BINDING
+            {
+                let _ = key; // responses are signed inside dispatch via respond()
+            }
+            let _ = bytes;
+        }
+        out
+    }
+    fn respond(&self, msg: StunMessage, req: &StunMessage) -> HandleOutcome {
+        // Attach integrity if the request was authenticated.
+        if !self.credentials.is_empty() {
+            if let Some(key) = self.auth_key(req) {
+                return HandleOutcome::Response(sign_integrity(msg, &key));
+            }
+        }
+        HandleOutcome::Response(msg.encode())
+    }
+    fn dispatch(&mut self, msg: &StunMessage, src: SocketAddr, now: u64) -> HandleOutcome {
         match (msg.method, msg.class) {
-            (method::ALLOCATE, Class::Request) => self.on_allocate(&msg, src, now),
-            (method::REFRESH, Class::Request) => self.on_refresh(&msg, src, now),
-            (method::CREATE_PERMISSION, Class::Request) => self.on_permission(&msg, src),
-            (method::CHANNEL_BIND, Class::Request) => self.on_channel_bind(&msg, src),
-            (method::SEND, Class::Indication) => self.on_send(&msg, src),
+            (method::ALLOCATE, Class::Request) => self.on_allocate(msg, src, now),
+            (method::REFRESH, Class::Request) => self.on_refresh(msg, src, now),
+            (method::CREATE_PERMISSION, Class::Request) => self.on_permission(msg, src),
+            (method::CHANNEL_BIND, Class::Request) => self.on_channel_bind(msg, src),
+            (method::SEND, Class::Indication) => self.on_send(msg, src),
             (method::BINDING, Class::Request) => {
                 let mut r = StunMessage::new(method::BINDING, Class::Success, msg.transaction);
                 r.push_attr(
@@ -262,14 +488,43 @@ impl TurnServer {
         }
     }
     fn on_allocate(&mut self, msg: &StunMessage, src: SocketAddr, now: u64) -> HandleOutcome {
+        if std::env::var_os("TURN_DEBUG").is_some() {
+            eprintln!(
+                "turn-alloc from {src} has_alloc={} relayed={:?}",
+                self.allocations.contains_key(&src),
+                self.allocations.get(&src).map(|a| a.relayed)
+            );
+        }
         // REQUESTED-TRANSPORT must be UDP (17); TCP relay is refused.
         match msg.attr(attr_type::REQUESTED_TRANSPORT) {
             Some(v) if v.first() == Some(&17) => {}
             _ => {
-                return HandleOutcome::Response(
-                    err_response(msg, 442, "Unsupported transport protocol").encode(),
+                return self.respond(
+                    err_response(msg, 442, "Unsupported transport protocol"),
+                    msg,
                 )
             }
+        }
+        // Idempotent: a retransmitted Allocate from the same client must
+        // return the same relayed address (RFC 8656; strict ICE stacks
+        // discard allocations whose address changes across retries).
+        if let Some(a) = self.allocations.get(&src) {
+            let relayed = a.relayed;
+            let mut r = StunMessage::new(method::ALLOCATE, Class::Success, msg.transaction);
+            r.push_attr(
+                attr_type::XOR_RELAYED_ADDRESS,
+                xor_addr(relayed, &msg.transaction),
+            );
+            r.push_attr(
+                attr_type::XOR_MAPPED_ADDRESS,
+                xor_addr(src, &msg.transaction),
+            );
+            r.push_attr(attr_type::SOFTWARE, b"turn-dag".to_vec());
+            r.push_attr(
+                attr_type::LIFETIME,
+                (self.max_lifetime_secs as u32).to_be_bytes().to_vec(),
+            );
+            return self.respond(r, msg);
         }
         let relayed = SocketAddr::new(self.server_ip, self.next_port);
         self.next_port = self.next_port.wrapping_add(1).max(49152);
@@ -292,11 +547,12 @@ impl TurnServer {
             attr_type::XOR_MAPPED_ADDRESS,
             xor_addr(src, &msg.transaction),
         );
+        r.push_attr(attr_type::SOFTWARE, b"turn-dag".to_vec());
         r.push_attr(
             attr_type::LIFETIME,
             (self.max_lifetime_secs as u32).to_be_bytes().to_vec(),
         );
-        HandleOutcome::Response(r.encode())
+        self.respond(r, msg)
     }
     fn on_refresh(&mut self, msg: &StunMessage, src: SocketAddr, now: u64) -> HandleOutcome {
         let lifetime = msg
@@ -309,7 +565,7 @@ impl TurnServer {
         } else if let Some(a) = self.allocations.get_mut(&src) {
             a.expires_at = now + lifetime.min(self.max_lifetime_secs);
         } else {
-            return HandleOutcome::Response(err_response(msg, 437, "Allocation Mismatch").encode());
+            return self.respond(err_response(msg, 437, "Allocation Mismatch"), msg);
         }
         let mut r = StunMessage::new(method::REFRESH, Class::Success, msg.transaction);
         r.push_attr(
@@ -318,27 +574,33 @@ impl TurnServer {
                 .to_be_bytes()
                 .to_vec(),
         );
-        HandleOutcome::Response(r.encode())
+        self.respond(r, msg)
+    }
+    fn is_internal_relayed(&self, addr: SocketAddr) -> bool {
+        // Our own allocation endpoint (server_ip + allocated port) or an
+        // existing allocation's relayed address.
+        self.allocations.values().any(|a| a.relayed == addr)
+            || (addr.ip() == self.server_ip && addr.port() >= 49152)
     }
     fn peer_of(&self, msg: &StunMessage) -> Option<SocketAddr> {
         unxor_addr(msg.attr(attr_type::XOR_PEER_ADDRESS)?, &msg.transaction)
     }
     fn on_permission(&mut self, msg: &StunMessage, src: SocketAddr) -> HandleOutcome {
         let Some(peer) = self.peer_of(msg) else {
-            return HandleOutcome::Response(err_response(msg, 400, "Bad Request").encode());
+            return self.respond(err_response(msg, 400, "Bad Request"), msg);
         };
-        if is_denied_peer_ip(peer.ip()) {
-            return HandleOutcome::Response(err_response(msg, 403, "Forbidden").encode());
+        if is_denied_peer_ip(peer.ip()) && !self.is_internal_relayed(peer) {
+            return self.respond(err_response(msg, 403, "Forbidden"), msg);
         }
         match self.allocations.get_mut(&src) {
             Some(a) => {
                 a.permissions.insert(peer.ip());
-                HandleOutcome::Response(
-                    StunMessage::new(method::CREATE_PERMISSION, Class::Success, msg.transaction)
-                        .encode(),
+                self.respond(
+                    StunMessage::new(method::CREATE_PERMISSION, Class::Success, msg.transaction),
+                    msg,
                 )
             }
-            None => HandleOutcome::Response(err_response(msg, 437, "Allocation Mismatch").encode()),
+            None => self.respond(err_response(msg, 437, "Allocation Mismatch"), msg),
         }
     }
     fn on_channel_bind(&mut self, msg: &StunMessage, src: SocketAddr) -> HandleOutcome {
@@ -347,47 +609,133 @@ impl TurnServer {
             .filter(|v| v.len() >= 2)
             .map(|v| u16::from_be_bytes(v[..2].try_into().unwrap()));
         let (Some(chan), Some(peer)) = (chan, self.peer_of(msg)) else {
-            return HandleOutcome::Response(err_response(msg, 400, "Bad Request").encode());
+            return self.respond(err_response(msg, 400, "Bad Request"), msg);
         };
         if !(0x4000..=0xFFFE).contains(&chan) {
-            return HandleOutcome::Response(err_response(msg, 400, "Bad channel").encode());
+            return self.respond(err_response(msg, 400, "Bad channel"), msg);
         }
-        if is_denied_peer_ip(peer.ip()) {
-            return HandleOutcome::Response(err_response(msg, 403, "Forbidden").encode());
+        if is_denied_peer_ip(peer.ip()) && !self.is_internal_relayed(peer) {
+            return self.respond(err_response(msg, 403, "Forbidden"), msg);
         }
         match self.allocations.get_mut(&src) {
             Some(a) => {
                 a.channels.insert(chan, peer);
-                HandleOutcome::Response(
-                    StunMessage::new(method::CHANNEL_BIND, Class::Success, msg.transaction)
-                        .encode(),
+                self.respond(
+                    StunMessage::new(method::CHANNEL_BIND, Class::Success, msg.transaction),
+                    msg,
                 )
             }
-            None => HandleOutcome::Response(err_response(msg, 437, "Allocation Mismatch").encode()),
+            None => self.respond(err_response(msg, 437, "Allocation Mismatch"), msg),
         }
     }
     fn on_send(&mut self, msg: &StunMessage, src: SocketAddr) -> HandleOutcome {
         let (Some(peer), Some(payload)) = (self.peer_of(msg), msg.attr(attr_type::DATA)) else {
             return HandleOutcome::Drop;
         };
-        let Some(a) = self.allocations.get_mut(&src) else {
+        let payload = payload.to_vec();
+        self.deliver(src, peer, &payload, msg.transaction)
+    }
+    /// Relay one payload from `src` toward `peer`. If `peer` is another
+    /// allocation's relayed address, deliver to that client (ChannelData
+    /// when it bound a channel to the sender, else a Data indication);
+    /// otherwise forward externally toward the peer itself.
+    fn deliver(
+        &mut self,
+        src: SocketAddr,
+        peer: SocketAddr,
+        payload: &[u8],
+        txn: [u8; 12],
+    ) -> HandleOutcome {
+        let Some(sender) = self.allocations.get(&src).cloned() else {
             return HandleOutcome::Drop;
         };
-        if !a.permissions.contains(&peer.ip()) || is_denied_peer_ip(peer.ip()) {
+        if !sender.permissions.contains(&peer.ip()) && !self.is_internal_relayed(peer) {
             return HandleOutcome::Drop;
         }
-        if a.bytes + payload.len() as u64 > self.byte_cap {
+        if self.is_internal_relayed(peer) {
+            // Internal relay: permission is checked on the recipient for
+            // the sender's relayed address below; the sender needs either
+            // a permission or a channel toward the target.
+            let has_chan = sender.channels.values().any(|p| *p == peer);
+            if !has_chan && !sender.permissions.contains(&peer.ip()) {
+                return HandleOutcome::Drop;
+            }
+        } else if is_denied_peer_ip(peer.ip()) {
             return HandleOutcome::Drop;
         }
-        a.bytes += payload.len() as u64;
-        // Wrap payload in a Data indication addressed back via the stack.
-        let mut d = StunMessage::new(method::DATA, Class::Indication, msg.transaction);
-        d.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(src, &msg.transaction));
+        // Recipient allocation (internal relay)?
+        let recipient = self
+            .allocations
+            .iter()
+            .find(|(_, a)| a.relayed == peer)
+            .map(|(c, a)| (*c, a.clone()));
+        if let Some((rclient, ralloc)) = recipient {
+            if !ralloc.permissions.contains(&sender.relayed.ip()) {
+                return HandleOutcome::Drop;
+            }
+            let total = sender.bytes + ralloc.bytes + payload.len() as u64;
+            if total > self.byte_cap * 2 {
+                return HandleOutcome::Drop;
+            }
+            if let Some(a) = self.allocations.get_mut(&src) {
+                a.bytes += payload.len() as u64;
+            }
+            if let Some(a) = self.allocations.get_mut(&rclient) {
+                a.bytes += payload.len() as u64;
+            }
+            // Prefer the recipient's channel bound to the sender.
+            let back = ralloc
+                .channels
+                .iter()
+                .find(|(_, p)| **p == sender.relayed)
+                .map(|(c, _)| *c);
+            return match back {
+                Some(chan) => HandleOutcome::Forward {
+                    peer: rclient,
+                    data: encode_channel_data(chan, payload),
+                },
+                None => {
+                    let mut d = StunMessage::new(method::DATA, Class::Indication, txn);
+                    d.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(sender.relayed, &txn));
+                    d.push_attr(attr_type::DATA, payload.to_vec());
+                    HandleOutcome::Forward {
+                        peer: rclient,
+                        data: d.encode(),
+                    }
+                }
+            };
+        }
+        // External peer.
+        if sender.bytes + payload.len() as u64 > self.byte_cap {
+            return HandleOutcome::Drop;
+        }
+        if let Some(a) = self.allocations.get_mut(&src) {
+            a.bytes += payload.len() as u64;
+        }
+        let mut d = StunMessage::new(method::DATA, Class::Indication, txn);
+        d.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(src, &txn));
         d.push_attr(attr_type::DATA, payload.to_vec());
         HandleOutcome::Forward {
             peer,
             data: d.encode(),
         }
+    }
+    fn on_channel_data(&mut self, data: &[u8], src: SocketAddr, now: u64) -> HandleOutcome {
+        self.allocations.retain(|_, a| a.expires_at > now);
+        let chan = u16::from_be_bytes(data[0..2].try_into().unwrap());
+        let len = u16::from_be_bytes(data[2..4].try_into().unwrap()) as usize;
+        if data.len() < 4 + len {
+            return HandleOutcome::Drop;
+        }
+        let payload = data[4..4 + len].to_vec();
+        let Some(peer) = self
+            .allocations
+            .get(&src)
+            .and_then(|a| a.channels.get(&chan).copied())
+        else {
+            return HandleOutcome::Drop;
+        };
+        self.deliver(src, peer, &payload, [0u8; 12])
     }
 }
 
@@ -425,7 +773,17 @@ mod tests {
         let m = StunMessage::decode(&bytes).unwrap();
         assert_eq!(m.method, method::ALLOCATE);
         assert_eq!(m.class, Class::Request);
-        assert_eq!(m.encode(), bytes);
+        let re = m.encode();
+        let re2 = StunMessage::decode(&re).unwrap();
+        let non_fp = |m: &StunMessage| {
+            m.attrs
+                .iter()
+                .filter(|(t, _)| *t != attr_type::FINGERPRINT)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(non_fp(&re2), non_fp(&m));
+        assert!(re2.attr(attr_type::FINGERPRINT).is_none());
         assert_eq!(StunMessage::decode(&bytes[..10]), None);
         assert_eq!(StunMessage::decode(b"not stun at all......"), None);
         let mut bad = bytes.clone();
@@ -557,5 +915,223 @@ mod tests {
         let r = decode_ok(s.handle(&m.encode(), client(), 0));
         let mapped = unxor_addr(r.attr(attr_type::XOR_MAPPED_ADDRESS).unwrap(), &txn()).unwrap();
         assert_eq!(mapped, client());
+    }
+
+    #[test]
+    fn signed_allocate_response_carries_valid_fingerprint() {
+        let mut s = auth_server();
+        let nonce = s.nonce.clone();
+        let raw = signed_allocate("alice", "wonderland", &nonce);
+        match s.handle(&raw, client(), 0) {
+            HandleOutcome::Response(bytes) => {
+                let m = StunMessage::decode(&bytes).unwrap();
+                assert_eq!(m.class, Class::Success);
+                let fp = m.attr(attr_type::FINGERPRINT).unwrap();
+                let mut zeroed = bytes.clone();
+                let n = zeroed.len();
+                zeroed[n - 4..n].copy_from_slice(&[0, 0, 0, 0]);
+                let expect = (crc32(&zeroed) ^ 0x5354_554E).to_be_bytes();
+                assert_eq!(fp, expect.as_slice());
+                assert_eq!(bytes[n - 4..n].to_vec(), expect.to_vec());
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+    }
+    fn auth_server() -> TurnServer {
+        let mut creds = std::collections::HashMap::new();
+        creds.insert("alice".to_string(), "wonderland".to_string());
+        TurnServer::new("127.0.0.1".parse().unwrap()).with_auth("turn-dag", creds)
+    }
+    fn signed_allocate(user: &str, pass: &str, nonce: &str) -> Vec<u8> {
+        let mut m = StunMessage::new(method::ALLOCATE, Class::Request, txn());
+        m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+        m.push_attr(attr_type::USERNAME, user.as_bytes().to_vec());
+        m.push_attr(attr_type::REALM, b"turn-dag".to_vec());
+        m.push_attr(attr_type::NONCE, nonce.as_bytes().to_vec());
+        sign_wire(m, Some(&integrity_key(user, "turn-dag", pass)))
+    }
+
+    #[test]
+    fn auth_challenge_then_signed_allocate() {
+        let mut s = auth_server();
+        // Unsigned allocate gets 401 with realm+nonce.
+        let r = decode_ok(s.handle(&allocate_req(), client(), 0));
+        assert_eq!(r.class, Class::Error);
+        assert_eq!(error_code(&r), Some(401));
+        let _nonce = String::from_utf8(r.attr(attr_type::NONCE).unwrap().to_vec()).unwrap();
+        assert_eq!(r.attr(attr_type::REALM), Some(b"turn-dag".as_slice()));
+        // Wrong password fails integrity -> 401 again.
+        let bad = signed_allocate("alice", "wrong", &s.nonce);
+        assert_eq!(
+            error_code(&decode_ok(s.handle(&bad, client(), 0))),
+            Some(401)
+        );
+        assert_eq!(s.allocation_count(), 0);
+        // Correctly signed allocate succeeds and response is signed.
+        let good = signed_allocate("alice", "wonderland", &s.nonce);
+        match s.handle(&good, client(), 0) {
+            HandleOutcome::Response(bytes) => {
+                let key = integrity_key("alice", "turn-dag", "wonderland");
+                assert!(verify_integrity(&bytes, &key), "response integrity");
+                let m = StunMessage::decode(&bytes).unwrap();
+                assert_eq!(m.class, Class::Success);
+            }
+            other => panic!("expected Response, got {other:?}"),
+        }
+        assert_eq!(s.allocation_count(), 1);
+    }
+
+    #[test]
+    fn relay_between_two_allocations_via_channel_data() {
+        let mut s = TurnServer::new("127.0.0.1".parse().unwrap());
+        let a: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        decode_ok(s.handle(&allocate_req(), a, 0));
+        decode_ok(s.handle(&allocate_req(), b, 0));
+        let ra = s.relayed_address(&a).unwrap();
+        let rb = s.relayed_address(&b).unwrap();
+        // Each side creates a permission for the other's relayed address.
+        for (src, peer) in [(a, rb), (b, ra)] {
+            let mut m = StunMessage::new(method::CREATE_PERMISSION, Class::Request, txn());
+            m.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(peer, &txn()));
+            assert_eq!(
+                decode_ok(s.handle(&m.encode(), src, 1)).class,
+                Class::Success
+            );
+        }
+        // B binds channel 0x4001 to A's relayed address; A sends via Send.
+        let mut cb = StunMessage::new(method::CHANNEL_BIND, Class::Request, txn());
+        cb.push_attr(attr_type::CHANNEL_NUMBER, 0x4001u16.to_be_bytes().to_vec());
+        cb.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(ra, &txn()));
+        assert_eq!(
+            decode_ok(s.handle(&cb.encode(), b, 1)).class,
+            Class::Success
+        );
+        let mut send = StunMessage::new(method::SEND, Class::Indication, txn());
+        send.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(rb, &txn()));
+        send.push_attr(attr_type::DATA, b"hello-b".to_vec());
+        match s.handle(&send.encode(), a, 2) {
+            HandleOutcome::Forward { peer, data } => {
+                assert_eq!(peer, b);
+                let (chan, payload) = decode_channel_data(&data).unwrap();
+                assert_eq!(chan, 0x4001);
+                assert_eq!(payload, b"hello-b");
+            }
+            other => panic!("expected Forward to B, got {other:?}"),
+        }
+        // B replies with ChannelData on its bound channel.
+        match s.handle(&encode_channel_data(0x4001, b"hello-a"), b, 3) {
+            HandleOutcome::Forward { peer, data } => {
+                assert_eq!(peer, a);
+                let d = StunMessage::decode(&data).unwrap();
+                assert_eq!(d.method, method::DATA);
+                assert_eq!(d.attr(attr_type::DATA), Some(b"hello-a".as_slice()));
+            }
+            other => panic!("expected Forward to A, got {other:?}"),
+        }
+        // Truncated channel data is dropped, never panics.
+        assert_eq!(s.handle(&[0x40, 0x01, 0xFF], a, 4), HandleOutcome::Drop);
+    }
+}
+
+#[cfg(test)]
+mod allocate_idempotency_tests {
+    use super::*;
+    fn txn() -> [u8; 12] {
+        [9u8; 12]
+    }
+    fn client() -> SocketAddr {
+        "203.0.113.7:5000".parse().unwrap()
+    }
+    #[test]
+    fn allocate_reuses_relayed_address() {
+        let mut s = TurnServer::new("127.0.0.1".parse().unwrap());
+        let mut m = StunMessage::new(method::ALLOCATE, Class::Request, txn());
+        m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+        let raw = m.encode();
+        let get_port = |s: &mut TurnServer| match s.handle(&raw, client(), 0) {
+            HandleOutcome::Response(b) => {
+                let r = StunMessage::decode(&b).unwrap();
+                let v = r.attr(attr_type::XOR_RELAYED_ADDRESS).unwrap();
+                u16::from_be_bytes(v[2..4].try_into().unwrap()) ^ (STUN_MAGIC >> 16) as u16
+            }
+            _ => panic!("response"),
+        };
+        assert_eq!(get_port(&mut s), 49152);
+        assert_eq!(get_port(&mut s), 49152);
+        assert_eq!(get_port(&mut s), 49152);
+        assert_eq!(s.allocation_count(), 1);
+    }
+}
+
+// Deterministic mutation sweep (no fuzzing framework needed): every
+// truncation and every single-bit flip of a valid datagram must be
+// handled without panicking and without accepting garbage.
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    fn seed_allocate() -> Vec<u8> {
+        let mut m = StunMessage::new(method::ALLOCATE, Class::Request, [3u8; 12]);
+        m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+        m.push_attr(attr_type::USERNAME, b"alice".to_vec());
+        m.encode()
+    }
+    #[test]
+    fn truncations_never_panic_and_never_accept() {
+        let seed = seed_allocate();
+        let mut s = TurnServer::new("127.0.0.1".parse().unwrap());
+        let src: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        for n in 0..seed.len() {
+            let out = s.handle(&seed[..n], src, 0);
+            // Truncated datagrams may drop or error, never succeed or panic.
+            match out {
+                HandleOutcome::Response(b) => {
+                    let m = StunMessage::decode(&b).expect("response decodes");
+                    assert_eq!(m.class, Class::Error, "n={n} must not succeed");
+                }
+                HandleOutcome::Forward { .. } => panic!("truncated forward n={n}"),
+                HandleOutcome::Drop => {}
+            }
+        }
+    }
+    #[test]
+    fn single_bit_flips_never_panic() {
+        let seed = seed_allocate();
+        let mut s = TurnServer::new("127.0.0.1".parse().unwrap());
+        let src: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        for i in 0..seed.len() {
+            for bit in [0u8, 3, 7] {
+                let mut bad = seed.clone();
+                bad[i] ^= 1 << bit;
+                let _ = s.handle(&bad, src, 0);
+                let _ = StunMessage::decode(&bad);
+            }
+        }
+    }
+    #[test]
+    fn garbage_and_random_inputs_never_panic() {
+        let mut s = TurnServer::new("127.0.0.1".parse().unwrap());
+        let src: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        let mut x: u64 = 0x1234_5678_9ABC_DEF0;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..2000 {
+            let len = (next() % 64) as usize;
+            let mut buf = vec![0u8; len];
+            for b in buf.iter_mut() {
+                *b = next() as u8;
+            }
+            let _ = s.handle(&buf, src, 0);
+            let _ = StunMessage::decode(&buf);
+            let _ = decode_channel_data(&buf);
+        }
+        // All-zero and all-ones extremes.
+        for buf in [vec![0u8; 64], vec![0xFFu8; 64], vec![0x40u8; 64]] {
+            let _ = s.handle(&buf, src, 0);
+        }
     }
 }

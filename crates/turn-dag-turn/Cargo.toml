@@ -12,8 +12,13 @@ sha1 = "0.10"
 base64 = "0.22"
 ipnet = "2"
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp", "socket-tcp"] }
+md-5 = "0.11.0"
+rustls = "0.23.46"
+rustls-pemfile = "2.2.0"
+libc = "0.2.191"
 
 [dev-dependencies]
 turn-dag-minter = { path = "../turn-dag-minter" }
 turn-dag-wallet = { path = "../turn-dag-wallet" }
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp", "socket-tcp"] }
+rcgen = "0.13"
