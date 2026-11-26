@@ -106,15 +106,19 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Extract one STUN/ChannelData frame from a stream buffer (TCP/TLS
-/// framing is length-delimited; ChannelData over stream transports
-/// carries no UDP padding). Returns None when more bytes are needed.
+/// Extract one STUN/ChannelData frame from a stream buffer. Over
+/// stream transports (TCP/TLS) ChannelData is padded to a 4-byte
+/// boundary (RFC 8656 stream framing): consuming it unpadded leaves
+/// 1-3 zero bytes that desync every following frame - DTLS starts,
+/// then the stream silently blackholes. STUN messages are always
+/// a multiple of 4 bytes already. Returns None if more bytes needed.
 pub fn take_frame(buf: &mut Vec<u8>) -> Option<Vec<u8>> {
     if buf.len() < 4 {
         return None;
     }
     let total = if buf[0] >> 6 == 0b01 {
-        4 + u16::from_be_bytes([buf[2], buf[3]]) as usize
+        let len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
+        4 + len + (4 - len % 4) % 4
     } else if buf[0] >> 6 == 0 {
         if buf.len() < 20 {
             return None;
@@ -203,7 +207,7 @@ pub struct LiveTlsTurnServer<D: Device> {
     stack: UserSpaceStack<D>,
     config: Arc<rustls::ServerConfig>,
     turn: TurnServer,
-    listener: smoltcp::iface::SocketHandle,
+    listeners: Vec<smoltcp::iface::SocketHandle>,
     port: u16,
     conns: Vec<TlsConn>,
     now_ms: i64,
@@ -217,21 +221,24 @@ impl<D: Device> LiveTlsTurnServer<D> {
         port: u16,
     ) -> io::Result<Self> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let placeholder = stack.tcp_handle;
         let mut srv = Self {
             stack,
             config,
             turn,
-            listener: placeholder,
+            listeners: Vec::new(),
             port,
             conns: Vec::new(),
             now_ms: 0,
         };
-        let h = srv.stack.add_tcp_socket();
-        srv.stack
-            .tcp_listen(h, port)
-            .map_err(|e| io::Error::other(format!("tls listen: {e:?}")))?;
-        srv.listener = h;
+        // A pool of listening sockets: one smoltcp listener captures
+        // a single SYN, so simultaneous connects would otherwise RST.
+        for _ in 0..4 {
+            let h = srv.stack.add_tcp_socket();
+            srv.stack
+                .tcp_listen(h, port)
+                .map_err(|e| io::Error::other(format!("tls listen: {e:?}")))?;
+            srv.listeners.push(h);
+        }
         Ok(srv)
     }
 
@@ -258,37 +265,43 @@ impl<D: Device> LiveTlsTurnServer<D> {
         self.now_ms += 5;
         let now = self.now_ms;
         self.stack.poll(now);
-        if std::env::var_os("TURN_DEBUG").is_some() {
-            let st = self.stack.tcp_state(self.listener);
-            if st != smoltcp::socket::tcp::State::Listen {
-                eprintln!("turn-tls listener state: {st:?} conns={}", self.conns.len());
+        // Accept: a listening socket itself becomes the connection;
+        // replace it so the pool always has listeners ready.
+        for li in 0..self.listeners.len() {
+            let handle = self.listeners[li];
+            if self.stack.tcp_state(handle) != smoltcp::socket::tcp::State::Established {
+                continue;
             }
-        }
-        // Accept: the listening socket itself becomes the connection.
-        if self.stack.tcp_state(self.listener) == smoltcp::socket::tcp::State::Established {
-            if let Some(ep) = self.stack.tcp_remote_endpoint(self.listener) {
-                let src = Self::endpoint_to_std(ep);
-                match rustls::ServerConnection::new(self.config.clone()) {
-                    Ok(tls) => {
-                        if std::env::var_os("TURN_DEBUG").is_some() {
-                            eprintln!("turn-tls accept from {src}");
+            let Some(ep) = self.stack.tcp_remote_endpoint(handle) else {
+                continue;
+            };
+            let src = Self::endpoint_to_std(ep);
+            match rustls::ServerConnection::new(self.config.clone()) {
+                Ok(tls) => {
+                    if std::env::var_os("TURN_DEBUG").is_some() {
+                        eprintln!("turn-tls accept from {src}");
+                    }
+                    self.conns.push(TlsConn {
+                        handle,
+                        tls,
+                        plain_in: Vec::new(),
+                        cipher_out: Vec::new(),
+                        src,
+                        dead: false,
+                    });
+                    let h = self.stack.add_tcp_socket();
+                    match self.stack.tcp_listen(h, self.port) {
+                        Ok(()) => {
+                            self.listeners[li] = h;
                         }
-                        let handle = self.listener;
-                        self.conns.push(TlsConn {
-                            handle,
-                            tls,
-                            plain_in: Vec::new(),
-                            cipher_out: Vec::new(),
-                            src,
-                            dead: false,
-                        });
-                        let h = self.stack.add_tcp_socket();
-                        if self.stack.tcp_listen(h, self.port).is_ok() {
-                            self.listener = h;
+                        Err(e) => {
+                            if std::env::var_os("TURN_DEBUG").is_some() {
+                                eprintln!("turn-tls re-listen failed: {e:?}");
+                            }
                         }
                     }
-                    Err(_) => return Ok(true),
                 }
+                Err(_) => return Ok(true),
             }
         }
         let mut worked = false;
@@ -301,6 +314,19 @@ impl<D: Device> LiveTlsTurnServer<D> {
         for idx in 0..self.conns.len() {
             let src = self.conns[idx].src;
             while let Some(frame) = take_frame(&mut self.conns[idx].plain_in) {
+                if std::env::var_os("TURN_DEBUG").is_some() {
+                    let desc = crate::wire::StunMessage::decode(&frame)
+                        .map(|m| {
+                            format!(
+                                "stun method={:#x} class={:?} len={}",
+                                m.method,
+                                m.class,
+                                frame.len()
+                            )
+                        })
+                        .unwrap_or_else(|| format!("channeldata/other len={}", frame.len()));
+                    eprintln!("turn-tls frame from {src}: {desc}");
+                }
                 match self.turn.handle(&frame, src, now_secs()) {
                     HandleOutcome::Response(bytes) => outputs.push((None, idx, bytes)),
                     HandleOutcome::Forward { peer, data } => outputs.push((Some(peer), idx, data)),
@@ -473,8 +499,8 @@ mod tests {
         let mut buf = bytes[..10].to_vec();
         assert_eq!(take_frame(&mut buf), None);
         buf.extend_from_slice(&bytes[10..]);
-        // Stream transports carry ChannelData unpadded (length-delimited).
-        buf.extend_from_slice(&[0x40, 0x01, 0, 2, b'x', b'y']);
+        // Stream transports pad ChannelData to a 4-byte boundary.
+        buf.extend_from_slice(&[0x40, 0x01, 0, 2, b'x', b'y', 0, 0]);
         let f1 = take_frame(&mut buf).unwrap();
         assert_eq!(StunMessage::decode(&f1).unwrap().method, method::ALLOCATE);
         let f2 = take_frame(&mut buf).unwrap();
@@ -555,6 +581,49 @@ mod tests {
         assert_eq!(reply[9], 6, "reply is TCP");
         let tcp = &reply[20..];
         assert_eq!(tcp[13] & 0x12, 0x12, "SYN-ACK flags, got {:#x}", tcp[13]);
+    }
+
+    #[test]
+    fn tls_server_two_simultaneous_syns_both_answered() {
+        // Listener pool: two SYNs from different clients in the same
+        // poll window must both get SYN-ACKs (a single listening
+        // socket would RST the second).
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let rc = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let scfg = crate::tls::server_config(
+            rc.cert.pem().as_bytes(),
+            rc.key_pair.serialize_pem().as_bytes(),
+        )
+        .unwrap();
+        let stack = UserSpaceStack::new(IpAddress::v4(10, 99, 0, 1), 24, crate::TURN_PORT);
+        let turn = TurnServer::new("10.99.0.1".parse::<IpAddr>().unwrap());
+        let mut srv = LiveTlsTurnServer::new(stack, scfg, turn, 5349).unwrap();
+        srv.stack.device.inject(craft_tcp(
+            [10, 99, 0, 2],
+            [10, 99, 0, 1],
+            40001,
+            5349,
+            100,
+            &[],
+        ));
+        srv.stack.device.inject(craft_tcp(
+            [10, 99, 0, 2],
+            [10, 99, 0, 1],
+            40002,
+            5349,
+            200,
+            &[],
+        ));
+        srv.serve_once().unwrap();
+        srv.serve_once().unwrap();
+        let synacks = srv
+            .stack
+            .device
+            .tx_queue
+            .iter()
+            .filter(|p| p.len() > 33 && p[9] == 6 && (p[33] & 0x12) == 0x12)
+            .count();
+        assert_eq!(synacks, 2, "both simultaneous SYNs answered");
     }
 
     #[test]

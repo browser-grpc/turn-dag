@@ -16,8 +16,21 @@ if [ -z "$HOST" ]; then
 fi
 TLS_PID=""
 if [ -c /dev/net/tun ] && command -v openssl >/dev/null 2>&1; then
-  openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/turns-key.pem -out /tmp/turns-cert.pem \
-    -days 2 -subj "/CN=10.99.0.1" -addext "subjectAltName=IP:10.99.0.1" >/dev/null 2>&1 || true
+  # Test CA + CA-signed server cert: Firefox can trust the CA via a
+  # pre-seeded profile (certutil), Chromium uses --ignore-certificate-errors.
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout /tmp/turns-ca-key.pem -out /tmp/turns-ca.pem \
+    -days 2 -subj "/CN=turn-dag-test-ca" -addext "basicConstraints=critical,CA:TRUE" >/dev/null 2>&1 || true
+  openssl req -newkey rsa:2048 -nodes -keyout /tmp/turns-key.pem -out /tmp/turns.csr \
+    -subj "/CN=10.99.0.1" >/dev/null 2>&1 || true
+  printf "subjectAltName=IP:10.99.0.1\n" > /tmp/turns-ext.cnf
+  openssl x509 -req -in /tmp/turns.csr -CA /tmp/turns-ca.pem -CAkey /tmp/turns-ca-key.pem \
+    -CAcreateserial -out /tmp/turns-cert.pem -days 2 -extfile /tmp/turns-ext.cnf >/dev/null 2>&1 || true
+  if command -v certutil >/dev/null 2>&1 && [ -f /tmp/turns-ca.pem ]; then
+    mkdir -p /tmp/ff-turns-profile
+    certutil -N -d sql:/tmp/ff-turns-profile --empty-password >/dev/null 2>&1 || true
+    certutil -A -n turn-dag-test-ca -t "CT,C,c" -i /tmp/turns-ca.pem -d sql:/tmp/ff-turns-profile >/dev/null 2>&1 || true
+    export FIREFOX_TURNS_PROFILE=/tmp/ff-turns-profile
+  fi
   if [ -f /tmp/turns-cert.pem ]; then
     ./target/debug/turn-dag-node serve-tls --cert /tmp/turns-cert.pem --key /tmp/turns-key.pem \
       --user browser-test-user --pass browser-test-secret >/tmp/turns-server.log 2>&1 &

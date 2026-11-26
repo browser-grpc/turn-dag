@@ -225,30 +225,37 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   `ip addr add 10.99.0.2/24 dev turndag0 && ip link set turndag0 up`
   (host-side address differs from the stack's 10.99.0.1).
   Chromium gathers a relay candidate over `turns:` in Docker
-  (`--cap-add NET_ADMIN --device /dev/net/tun`); Firefox turns:
-  SKIPs (self-signed test cert not trustable in a test profile).
-- Verified: `cargo test --workspace` (99 tests), clippy, fmt,
+  (`--cap-add NET_ADMIN --device /dev/net/tun`) and a full
+  Chromium DataChannel pair over `turns:` passes (this required
+  two more fixes: a pool of listening smoltcp sockets — one
+  listener RSTs simultaneous connects — and RFC 8656 padded
+  ChannelData stream framing in `take_frame`). Firefox turns:
+  SKIPs with evidence — packet capture shows this Firefox build
+  attempts `turn:?transport=tcp` but never initiates `turns:`.
+- Verified: `cargo test --workspace` (100 tests), clippy, fmt,
   `docker build --target ci`, and
   `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
-  (37 passed, 1 skipped — Firefox turns cert — 0 failed).
+  (38 passed, 1 skipped — Firefox turns — 0 failed).
 
-## Open questions — ask John before guessing
+## Decisions (settled 2026-11-25, "go all, pick as needed")
 
-- Mint issuance: v1 SHIPS with 10,000/epoch (configurable via
+- Mint issuance: **10,000/epoch stands** (configurable via
   `MinterConfig.target_per_epoch`; retarget clamp [0.25x, 4x] over 24h).
-  Confirm final number/epoch before any mainnet use.
-- Representative set: v1 SHIPS with delegation-based voting (any node
+  Rationale: already the shipped/tested default; changing supply
+  economics needs usage data, not guesswork. Revisit with metrics.
+- Representative set: **delegation-based voting stands** (any node
   can register/delegate; weight is stake, equivocation discards both
-  votes). A fixed-set mode is not implemented.
-- TURN server identity: v1 SHIPS one binary per node
-  (`turn-dag-node serve-udp`, issuer creds optional, UDP relay live +
-  wire protocol complete; TUN device + rustls TLS listener behind
-  `turn-dag-turn/{tun,tls}.rs` modules). Split issuer/relay roles are
-  not implemented.
-- Bounty/slash split: v1 SHIPS the spec rule 1 reporter / 4 burned,
-  enforced by validation. Confirm before changing.
-All four are code-configured defaults marked here instead of silently
-hardcoded; none requires a rewrite to change.
+  votes). A fixed-set mode is explicitly not built. Rationale: fixed
+  sets contradict the untrusted-participant design goal.
+- TURN server identity: **one binary per node stands**
+  (`turn-dag-node serve-udp` + `serve-tls`, issuer creds optional).
+  Split issuer/relay roles are explicitly not built. Rationale: role
+  split is an ops topology choice the single binary already covers.
+- Bounty/slash split: **spec rule 1 reporter / 4 burned stands**,
+  enforced by validation. Rationale: it is the spec's ≥100x economics;
+  do not tune without a spec change.
+All four remain code-configured values, so any decision can be
+revisited without a rewrite; they are no longer open questions.
 
 ## How to resume in Muse Code
 

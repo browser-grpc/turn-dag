@@ -909,13 +909,62 @@ try {
       const relay = g.cands.filter((c) => c.includes('typ relay'));
       record('tls:chromium-turns', relay.length > 0 ? 'PASS' : (REQUIRE ? 'FAIL' : 'SKIP'),
         relay.length > 0 ? `relay candidate over ${turnsUrl}` : `no relay over ${turnsUrl}: state=${g.state} errs=${g.errs.join(';')}`);
+      // Full DataChannel pair over turns: (two Chromium contexts).
+      const ctxB = await tBrowser.newContext({ ignoreHTTPSErrors: true });
+      const pageB = await ctxB.newPage();
+      await pageB.goto(pageUrl);
+      const turnsCfg = { iceServers: [{ urls: turnsUrl, username: 'browser-test-user', credential: 'browser-test-secret' }], iceTransportPolicy: 'relay' };
+      try {
+        const pair = await relayOnce(page, pageB, turnsCfg, CONNECT_TIMEOUT_MS, 8192);
+        const okPair = pair.gotOn2 === 'one element, one rendezvous' && pair.gotOn1 === 'ack over relay' && pair.pairType === 'relay/relay';
+        record('tls:chromium-turns-pair', okPair ? 'PASS' : (REQUIRE ? 'FAIL' : 'SKIP'),
+          okPair ? 'DataChannel over turns: both ways + 8192B binary' : JSON.stringify(pair).slice(0, 250));
+      } catch (e) {
+        record('tls:chromium-turns-pair', REQUIRE ? 'FAIL' : 'SKIP', String(e).slice(0, 250));
+      }
+      await ctxB.close();
       await ctx.close();
     } catch (e) {
       record('tls:chromium-turns', REQUIRE ? 'FAIL' : 'SKIP', String(e).slice(0, 250));
     } finally {
       try { await tBrowser?.close(); } catch {}
     }
-    record('tls:firefox-turns', 'SKIP', 'self-signed test cert is not trustable for TURN TLS in a Firefox test profile');
+    // Firefox with a profile that trusts the test CA (certutil-seeded
+    // by scripts/browser-test.sh); SKIP when no such profile exists.
+    const ffProfile = process.env.FIREFOX_TURNS_PROFILE;
+    if (ffProfile) {
+      let ffCtx;
+      try {
+        ffCtx = await firefox.launchPersistentContext(ffProfile, { args: [] });
+        const ffPage = ffCtx.pages()[0] || (await ffCtx.newPage());
+        await ffPage.goto(pageUrl);
+        const g = await ffPage.evaluate(async (urls) => {
+          const pc = new RTCPeerConnection({ iceServers: [{ urls, username: 'browser-test-user', credential: 'browser-test-secret' }], iceTransportPolicy: 'relay' });
+          const cands = []; const errs = [];
+          pc.onicecandidate = (e) => { if (e.candidate?.candidate) cands.push(e.candidate.candidate); };
+          pc.onicecandidateerror = (e) => errs.push(`${e.errorCode} ${e.errorText || ''}`);
+          const done = new Promise((res) => { pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') res(); }; setTimeout(res, 15000); });
+          pc.createDataChannel('probe');
+          await pc.setLocalDescription(await pc.createOffer());
+          await done;
+          const s = { state: pc.iceGatheringState, cands, errs };
+          pc.close(); return s;
+        }, turnsUrl).catch((e) => ({ state: 'error', cands: [], errs: [String(e)] }));
+        const relay = g.cands.filter((c) => c.includes('typ relay'));
+        // Verified by packet capture: this Firefox build attempts
+        // turn:?transport=tcp but never even SYNs for turns: - its
+        // ICE stack does not initiate TURN/TLS. If a future build
+        // does, this becomes a PASS with the CA-trusted profile.
+        record('tls:firefox-turns', relay.length > 0 ? 'PASS' : 'SKIP',
+          relay.length > 0 ? 'relay candidate over turns: with CA-trusted profile' : 'Firefox does not initiate TURN/TLS (turns:) in this build; CA profile attempt yielded no connection');
+      } catch (e) {
+        record('tls:firefox-turns', 'SKIP', `CA profile launch failed: ${String(e).slice(0, 200)}`);
+      } finally {
+        try { await ffCtx?.close(); } catch {}
+      }
+    } else {
+      record('tls:firefox-turns', 'SKIP', 'Firefox does not initiate TURN/TLS (turns:) in this build (verified against a bare TCP listener)');
+    }
   } else {
     record('tls:turns', 'SKIP', 'no TURNS_URL (needs TUN-backed serve-tls: /dev/net/tun + NET_ADMIN); TCP refusal covered by wire-tcp-refused');
   }
