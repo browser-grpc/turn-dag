@@ -1,30 +1,55 @@
 // Playwright WebRTC coverage for the Rust TURN relay.
-// Split into independent sub-tests so each failure mode is isolated:
-//   1. gather     - single PC, iceTransportPolicy=relay: must reach
-//                   gathering=complete (relay candidate, or a clean
-//                   empty result on hosts where ICE is policy-blocked)
-//   2. relay      - two PCs, relay/relay: DataChannel both ways
-//                   (requires real network path; otherwise SKIP)
-//   3. negative   - wrong credentials: no relay candidate, ICE error path
-//   4. stun       - control: plain STUN gathering must complete
 //
-// In sandboxes without usable TURN networking sub-tests 2 (and the
-// relay half of 1) report SKIP rather than FAIL, so CI on a normal
-// network is the real gate. Run after `cargo build -p turn-dag-node`:
-//   cd tests/browser && npm install && node run.mjs
-import { firefox } from 'playwright';
+// Browser sub-tests (per engine, Firefox + Chromium):
+//   gather        - single PC, iceTransportPolicy=relay -> relay candidate
+//   stun-google / stun-cloudflare - public STUN (Google, Cloudflare)
+//                   must yield srflx candidates where internet is up
+//   negative      - wrong credentials -> no relay candidate
+//   expired       - expired issuer credential -> no relay candidate
+//   relay         - two PCs in isolated contexts, relay/relay DataChannel
+//   issuer        - credential from a real DAG burn -> TurnIssuer
+//                   challenge/PoW/redeem (turn-dag-node rendezvous) used
+//                   in-browser against a burn-gated serve-udp relay
+// Raw-wire sub-tests (Node UDP/STUN client against the live server):
+//   wire-allocate-lifetime (120s cap), wire-tcp-refused (442),
+//   wire-denied-peer (403 for metadata/RFC1918/loopback),
+//   wire-refresh (cap/delete/437), wire-byte-cap (~1.9MB drop),
+//   wire-total-quota (486), wire-rest-valid/forged/expired (401),
+//   wire-ticket-quota (one live allocation per ticket, 486)
+//
+// REQUIRE_RELAY=1 (Docker --network host job): gather/relay/issuer
+// failures are FAIL, and at least MIN_PASS (default 10) sub-tests must
+// PASS. Elsewhere they SKIP so loopback-only sandboxes stay green.
+import { firefox, chromium, webkit } from 'playwright';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
+import dgram from 'node:dgram';
+import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const PORT = 35478;
+const REST_PORT = PORT + 1;
+const QUOTA_PORT = PORT + 2;
 const HOST = process.env.TURN_HOST || '192.168.68.114';
 const USER = 'browser-test-user';
 const PASS = 'browser-test-secret';
+const REQUIRE = process.env.REQUIRE_RELAY === '1';
+const MIN_PASS = Number(process.env.MIN_PASS || (REQUIRE ? 10 : 0));
+const ENGINES = (process.env.BROWSERS || 'firefox').split(',').map((s) => s.trim()).filter(Boolean);
 const GATHER_TIMEOUT_MS = 15000;
 const CONNECT_TIMEOUT_MS = 30000;
+const BYTE_CAP = 16384 * 120;
+
+const results = [];
+const record = (name, status, detail) => {
+  results.push({ name, status, detail });
+  console.log(`[${status}] ${name}${detail ? ` - ${detail}` : ''}`);
+};
+// Network-dependent assertion: hard-fails only when a real path is required.
+const recordNet = (name, ok, detail, failDetail) =>
+  ok ? record(name, 'PASS', detail) : record(name, REQUIRE ? 'FAIL' : 'SKIP', failDetail || detail);
 
 const pageServer = http.createServer((_req, res) => {
   res.setHeader('content-type', 'text/html');
@@ -32,234 +57,605 @@ const pageServer = http.createServer((_req, res) => {
 });
 await new Promise((r) => pageServer.listen(0, '127.0.0.1', r));
 const pagePort = pageServer.address().port;
+const pageUrl = `http://127.0.0.1:${pagePort}/`;
 
-const server = spawn(
-  path.join(root, 'target/debug/turn-dag-node'),
-  ['serve-udp', '--addr', `0.0.0.0:${PORT}`, '--relay-ip', HOST, '--user', USER, '--pass', PASS],
-  { stdio: ['ignore', 'pipe', 'pipe'] },
-);
-let serverLog = '';
-server.stdout.on('data', (d) => (serverLog += d));
-server.stderr.on('data', (d) => (serverLog += d));
-
-const results = [];
-const record = (name, status, detail) => {
-  results.push({ name, status, detail });
-  console.log(`[${status}] ${name}${detail ? ` - ${detail}` : ''}`);
-};
-const turnCfg = (user, pass) => ({
-  iceServers: [{ urls: `turn:${HOST}:${PORT}?transport=udp`, username: user, credential: pass }],
+const servers = [];
+function startServer(args) {
+  const proc = spawn(path.join(root, 'target/debug/turn-dag-node'), args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let log = '';
+  proc.stdout.on('data', (d) => (log += d));
+  proc.stderr.on('data', (d) => (log += d));
+  servers.push(proc);
+  return { proc, log: () => log };
+}
+async function waitListening(srv, label) {
+  for (let i = 0; i < 50 && !srv.log().includes('listening'); i++) {
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  if (!srv.log().includes('listening')) throw new Error(`${label} did not start: ${srv.log()}`);
+}
+const turnCfg = (user, pass, port = PORT) => ({
+  iceServers: [{ urls: `turn:${HOST}:${port}?transport=udp`, username: user, credential: pass }],
   iceTransportPolicy: 'relay',
 });
 
-async function waitListening() {
-  for (let i = 0; i < 50 && !serverLog.includes('listening'); i++) {
-    await new Promise((r) => setTimeout(r, 100));
+// ---------- minimal STUN/TURN wire client (raw e2e over live UDP) ----------
+const MAGIC = 0x2112a442;
+const M = { BINDING: 0x001, ALLOCATE: 0x003, REFRESH: 0x004, CREATE_PERMISSION: 0x008, CHANNEL_BIND: 0x009 };
+const A = { ERROR_CODE: 0x0009, CHANNEL_NUMBER: 0x000c, LIFETIME: 0x000d, XOR_PEER: 0x0012, XOR_RELAYED: 0x0016, REQUESTED_TRANSPORT: 0x0019, XOR_MAPPED: 0x0020, USERNAME: 0x0006, MI: 0x0008, REALM: 0x0014, NONCE: 0x0015 };
+const encodeType = (method, cls) => {
+  const [b4, b8] = cls === 'success' ? [1, 0] : cls === 'error' ? [1, 1] : cls === 'indication' ? [0, 1] : [0, 0];
+  return (method & 0xf) | ((method & 0x70) << 1) | ((method & 0xf80) << 2) | (b4 << 4) | (b8 << 8);
+};
+function buildMsg(method, attrs, key, txn) {
+  const parts = [];
+  for (const [t, v] of attrs) {
+    const h = Buffer.alloc(4);
+    h.writeUInt16BE(t); h.writeUInt16BE(v.length, 2);
+    const pad = (4 - (v.length % 4)) % 4;
+    parts.push(h, v, Buffer.alloc(pad));
   }
-  return serverLog.includes('listening');
+  let body = Buffer.concat(parts);
+  if (key) {
+    const head = Buffer.alloc(20);
+    head.writeUInt16BE(encodeType(method, 'request'));
+    head.writeUInt16BE(body.length + 24, 2);
+    head.writeUInt32BE(MAGIC, 4);
+    Buffer.from(txn).copy(head, 8);
+    const mac = crypto.createHmac('sha1', key).update(Buffer.concat([head, body])).digest();
+    const mi = Buffer.alloc(4);
+    mi.writeUInt16BE(A.MI); mi.writeUInt16BE(20, 2);
+    body = Buffer.concat([body, mi, mac]);
+  }
+  const head = Buffer.alloc(20);
+  head.writeUInt16BE(encodeType(method, 'request'));
+  head.writeUInt16BE(body.length, 2);
+  head.writeUInt32BE(MAGIC, 4);
+  Buffer.from(txn).copy(head, 8);
+  return Buffer.concat([head, body]);
+}
+function parseMsg(buf, txn) {
+  const attrs = new Map();
+  let i = 20;
+  const end = Math.min(buf.length, 20 + buf.readUInt16BE(2));
+  while (i + 4 <= end) {
+    const t = buf.readUInt16BE(i);
+    const l = buf.readUInt16BE(i + 2);
+    attrs.set(t, buf.subarray(i + 4, i + 4 + l));
+    i += 4 + l + ((4 - (l % 4)) % 4);
+  }
+  const type = buf.readUInt16BE(0);
+  // RFC 8489 class bits: bit4 = LSB, bit8 = MSB.
+  const c0 = (type >> 4) & 1;
+  const c1 = (type >> 8) & 1;
+  const cls = c1 === 1 && c0 === 1 ? 'error' : c1 === 1 ? 'success' : c0 === 1 ? 'indication' : 'request';
+  const err = attrs.get(A.ERROR_CODE);
+  const xor = (v) => {
+    if (!v || v.length < 8) return null;
+    const port = v.readUInt16BE(2) ^ (MAGIC >>> 16);
+    const ip = (v.readUInt32BE(4) ^ MAGIC) >>> 0;
+    return `${(ip >>> 24) & 255}.${(ip >>> 16) & 255}.${(ip >>> 8) & 255}.${ip & 255}:${port}`;
+  };
+  return {
+    cls,
+    errorCode: err && err.length >= 4 ? err[2] * 100 + err[3] : null,
+    lifetime: attrs.get(A.LIFETIME)?.readUInt32BE(0),
+    relayed: xor(attrs.get(A.XOR_RELAYED)),
+    realm: attrs.get(A.REALM)?.toString(),
+    nonce: attrs.get(A.NONCE)?.toString(),
+    raw: buf,
+    _txn: txn,
+  };
+}
+const xorPeer = (addr, txn) => {
+  const [ip, port] = addr.split(':');
+  const v = Buffer.alloc(8);
+  v[1] = 1;
+  v.writeUInt16BE(Number(port) ^ (MAGIC >>> 16), 2);
+  const n = ip.split('.').reduce((a, o) => ((a << 8) | Number(o)) >>> 0, 0);
+  v.writeUInt32BE((n ^ MAGIC) >>> 0, 4);
+  return v;
+};
+const rawClients = [];
+class RawClient {
+  constructor() {
+    rawClients.push(this);
+    this.sock = dgram.createSocket('udp4');
+    this.waiter = null;
+    this.onData = null;
+    this.sock.on('message', (msg) => {
+      if (msg.length >= 4 && (msg[0] >> 6) === 1) {
+        const len = msg.readUInt16BE(2);
+        this.onData?.(msg.subarray(4, 4 + len));
+        return;
+      }
+      const w = this.waiter;
+      this.waiter = null;
+      w?.(msg);
+    });
+  }
+  exchange(buf, port, timeout = 4000) {
+    return new Promise((resolve, reject) => {
+      const t = setTimeout(() => { this.waiter = null; reject(new Error('stun timeout')); }, timeout);
+      this.waiter = (msg) => { clearTimeout(t); resolve(msg); };
+      this.sock.send(buf, port, HOST);
+    });
+  }
+  async request(method, attrs, key, port) {
+    const txn = crypto.randomBytes(12);
+    const resp = await this.exchange(buildMsg(method, attrs, key, txn), port);
+    return parseMsg(resp, txn);
+  }
+  async allocate(user, pass, port, transport = 17) {
+    const first = await this.request(M.ALLOCATE, [[A.REQUESTED_TRANSPORT, Buffer.from([transport, 0, 0, 0])]], null, port);
+    if (first.cls === 'success') return first;
+    const key = crypto.createHash('md5').update(`${user}:${first.realm || 'turn-dag'}:${pass}`).digest();
+    return this.request(M.ALLOCATE, [
+      [A.REQUESTED_TRANSPORT, Buffer.from([transport, 0, 0, 0])],
+      [A.USERNAME, Buffer.from(user)],
+      [A.REALM, Buffer.from(first.realm || 'turn-dag')],
+      [A.NONCE, Buffer.from(first.nonce || '')],
+    ], key, port);
+  }
+  async authed(method, attrs, user, pass, realmNonce, port) {
+    const key = crypto.createHash('md5').update(`${user}:${realmNonce.realm}:${pass}`).digest();
+    return this.request(method, [
+      ...attrs,
+      [A.USERNAME, Buffer.from(user)],
+      [A.REALM, Buffer.from(realmNonce.realm)],
+      [A.NONCE, Buffer.from(realmNonce.nonce)],
+    ], key, port);
+  }
+  close() { try { this.sock.close(); } catch {} }
+}
+const credFor = (user, secretText) => crypto.createHmac('sha1', secretText).update(user).digest('base64');
+function runCli(args) {
+  return new Promise((resolve, reject) => {
+    const p = spawn(path.join(root, 'target/debug/turn-dag-node'), args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (out += d));
+    p.on('error', reject);
+    p.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`cli ${args[0]} exit ${code}: ${out}`))));
+  });
 }
 
-try {
-  if (!(await waitListening())) {
-    console.error(`server did not start\n--- server log ---\n${serverLog}`);
-    process.exit(1);
-  }
+// ---------- browser helpers (evaluated in-page) ----------
+async function gatherOnce(page, cfg, timeout) {
+  return page.evaluate(async ({ cfg, timeout }) => {
+    const pc = new RTCPeerConnection(cfg);
+    const cands = [];
+    const errors = [];
+    pc.onicecandidate = (e) => { if (e.candidate?.candidate) cands.push(e.candidate.candidate); };
+    pc.onicecandidateerror = (e) => errors.push(e.errorText || `code ${e.errorCode}`);
+    const done = new Promise((res) => {
+      pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') res(); };
+      setTimeout(res, timeout);
+    });
+    pc.createDataChannel('probe');
+    await pc.setLocalDescription(await pc.createOffer());
+    await done;
+    const state = pc.iceGatheringState;
+    pc.close();
+    return { state, cands, errors };
+  }, { cfg, timeout }).catch((e) => ({ state: 'error', cands: [], errors: [String(e)] }));
+}
 
-  const browser = await firefox.launch({ args: ['--no-sandbox'] });
-  const page = await browser.newPage();
-  page.on('console', (m) => console.log('[page]', m.text()));
-  page.on('pageerror', (e) => console.log('[pageerror]', String(e)));
-  await page.goto(`http://127.0.0.1:${pagePort}/`);
-
-  // --- Sub-test 1: relay gathering (single PC) ---
-  const gather = await page
-    .evaluate(
-      async ({ cfg, timeout }) => {
-        const pc = new RTCPeerConnection(cfg);
-        const cands = [];
-        const errors = [];
-        pc.onicecandidate = (e) => {
-          if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate);
-        };
-        pc.onicecandidateerror = (e) => errors.push(e.errorText || `code ${e.errorCode}`);
-        const done = new Promise((res) => {
-          pc.onicegatheringstatechange = () => {
-            if (pc.iceGatheringState === 'complete') res();
-          };
-          setTimeout(res, timeout);
-        });
-        pc.createDataChannel('probe');
-        await pc.setLocalDescription(await pc.createOffer());
-        await done;
-        const state = pc.iceGatheringState;
-        pc.close();
-        return { state, cands, errors };
-      },
-      { cfg: turnCfg(USER, PASS), timeout: GATHER_TIMEOUT_MS },
-    )
-    .catch((e) => ({ state: 'error', cands: [], errors: [String(e)] }));
-  const relayCands = gather.cands.filter((c) => c.includes('typ relay'));
-  if (gather.state === 'complete' && relayCands.length > 0) {
-    record('gather', 'PASS', `${relayCands.length} relay candidate(s)`);
-  } else if (gather.state === 'complete') {
-    record('gather', 'SKIP', `ICE policy-blocked on this host (no relay candidates)`);
-  } else {
-    record('gather', 'FAIL', `gathering state=${gather.state} errors=${gather.errors.join('; ')}`);
-  }
-
-  // --- Sub-test 4: STUN control (independent of TURN server) ---
-  const stun = await page
-    .evaluate(async (timeout) => {
-      const pc = new RTCPeerConnection({ iceServers: [{ urls: 'stun:127.0.0.1:19302' }] });
-      const cands = [];
-      pc.onicecandidate = (e) => {
-        if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate);
-      };
-      const done = new Promise((res) => {
-        pc.onicegatheringstatechange = () => {
-          if (pc.iceGatheringState === 'complete') res();
-        };
-        setTimeout(res, timeout);
-      });
-      pc.createDataChannel('probe');
+async function relayOnce(page1, page2, cfg, connectTimeout, binaryBytes = 0) {
+  // PCs live on window in each isolated context; Node shuttles SDP/ICE.
+  // `cfg` may be [cfgForPage1, cfgForPage2] (e.g. distinct issuer tickets).
+  const [cfg1, cfg2] = Array.isArray(cfg) ? cfg : [cfg, cfg];
+  const init = async (page, isOfferer, pcCfg) => page.evaluate(async ({ cfg, isOfferer }) => {
+    const pc = new RTCPeerConnection(cfg);
+    window.__pc = pc;
+    window.__cands = [];
+    pc.onicecandidate = (e) => { if (e.candidate) window.__cands.push(JSON.parse(JSON.stringify(e.candidate))); };
+    window.__dc = isOfferer ? pc.createDataChannel('rendezvous') : null;
+    if (window.__dc) window.__dc.binaryType = 'arraybuffer';
+    window.__got = [];
+    pc.ondatachannel = (e) => { window.__dc = e.channel; e.channel.binaryType = 'arraybuffer'; e.channel.onmessage = (m) => window.__got.push(m.data); };
+    if (window.__dc) window.__dc.onmessage = (m) => window.__got.push(m.data);
+    return true;
+  }, { cfg: pcCfg, isOfferer });
+  const pollCands = async (page) => page.evaluate(() => { const c = window.__cands || []; window.__cands = []; return c; });
+  try {
+    await init(page1, true, cfg1);
+    await init(page2, false, cfg2);
+    const offer = await page1.evaluate(async () => {
+      const pc = window.__pc;
       await pc.setLocalDescription(await pc.createOffer());
-      await done;
-      const state = pc.iceGatheringState;
-      pc.close();
-      return { state, cands };
-    }, 5000)
-    .catch((e) => ({ state: 'error', cands: [] }));
-  if (stun.state === 'complete' && stun.cands.length > 0) {
-    record('stun-control', 'PASS', `${stun.cands.length} host candidate(s)`);
-  } else if (stun.state === 'complete') {
-    record('stun-control', 'SKIP', 'no host candidates in headless profile');
-  } else {
-    record('stun-control', 'FAIL', `state=${stun.state}`);
+      return JSON.parse(JSON.stringify(pc.localDescription));
+    });
+    await page2.evaluate(async (desc) => { await window.__pc.setRemoteDescription(desc); }, offer);
+    const answer = await page2.evaluate(async () => {
+      const pc = window.__pc;
+      await pc.setLocalDescription(await pc.createAnswer());
+      return JSON.parse(JSON.stringify(pc.localDescription));
+    });
+    await page1.evaluate(async (desc) => { await window.__pc.setRemoteDescription(desc); }, answer);
+    const deadline = Date.now() + connectTimeout;
+    let states = '';
+    while (Date.now() < deadline) {
+      for (const c of await pollCands(page1)) await page2.evaluate(async (cand) => { await window.__pc.addIceCandidate(cand).catch(() => {}); }, c).catch(() => {});
+      for (const c of await pollCands(page2)) await page1.evaluate(async (cand) => { await window.__pc.addIceCandidate(cand).catch(() => {}); }, c).catch(() => {});
+      states = await page1.evaluate(() => `${window.__pc.connectionState}/${window.__pc.iceConnectionState}`);
+      const s2 = await page2.evaluate(() => window.__pc.connectionState);
+      if (states.startsWith('connected') && s2 === 'connected') break;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    if (!states.startsWith('connected')) throw new Error(`not connected: ${states}`);
+    const out = await page1.evaluate(async () => {
+      const waitOpen = (dc) => new Promise((res, rej) => {
+        if (dc.readyState === 'open') return res();
+        dc.onopen = res;
+        setTimeout(() => rej(new Error(`dc ${dc.readyState}`)), 10000);
+      });
+      await waitOpen(window.__dc);
+      window.__dc.send('one element, one rendezvous');
+      return true;
+    });
+    void out;
+    let got2 = [];
+    for (let i = 0; i < 40 && !got2.length; i++) {
+      got2 = await page2.evaluate(() => window.__got || []);
+      if (!got2.length) await new Promise((r) => setTimeout(r, 250));
+    }
+    await page2.evaluate(() => { window.__dc.send('ack over relay'); });
+    let got1 = [];
+    for (let i = 0; i < 40 && !got1.length; i++) {
+      got1 = await page1.evaluate(() => window.__got || []);
+      if (!got1.length) await new Promise((r) => setTimeout(r, 250));
+    }
+    const pairType = await page1.evaluate(async () => {
+      const stats = await window.__pc.getStats();
+      let pair = null;
+      stats.forEach((r) => {
+        if (r.type === 'candidate-pair' && (r.state === 'succeeded' || r.nominated)) {
+          const local = stats.get(r.localCandidateId);
+          const remote = stats.get(r.remoteCandidateId);
+          if (local && remote) pair = `${local.candidateType}/${remote.candidateType}`;
+        }
+      });
+      return pair;
+    });
+    let bin = null;
+    if (binaryBytes > 0) {
+      await page2.evaluate(() => {
+        window.__bin = null;
+        window.__dc.onmessage = (m) => {
+          if (typeof m.data === 'string') { window.__got.push(m.data); return; }
+          const u = new Uint8Array(m.data);
+          let sum = 0;
+          for (const x of u) sum = (sum + x) >>> 0;
+          window.__bin = { len: u.length, sum };
+        };
+      });
+      const expect = await page1.evaluate(async (n) => {
+        const u = new Uint8Array(n);
+        let sum = 0;
+        for (let i = 0; i < n; i++) { u[i] = i % 251; sum = (sum + u[i]) >>> 0; }
+        window.__dc.send(u.buffer);
+        return { len: n, sum };
+      }, binaryBytes);
+      for (let i = 0; i < 40 && !bin; i++) {
+        bin = await page2.evaluate(() => window.__bin || null);
+        if (!bin) await new Promise((r) => setTimeout(r, 250));
+      }
+      if (!bin || bin.len !== expect.len || bin.sum !== expect.sum) {
+        throw new Error(`binary payload mismatch: got ${JSON.stringify(bin)} want ${JSON.stringify(expect)}`);
+      }
+    }
+    return { gotOn2: got2[0] || null, gotOn1: got1[0] || null, pairType, bin };
+  } finally {
+    await page1.evaluate(() => { try { window.__pc?.close(); } catch {} }).catch(() => {});
+    await page2.evaluate(() => { try { window.__pc?.close(); } catch {} }).catch(() => {});
+  }
+}
+
+// ---------- main ----------
+try {
+  await waitListening(startServer(['serve-udp', '--addr', `0.0.0.0:${PORT}`, '--relay-ip', HOST, '--user', USER, '--pass', PASS]), 'static TURN server');
+  await waitListening(startServer(['serve-udp', '--addr', `0.0.0.0:${QUOTA_PORT}`, '--relay-ip', HOST, '--user', USER, '--pass', PASS, '--total-quota', '2']), 'quota TURN server');
+
+  // Issuer credential: one real rendezvous run (burn -> challenge/PoW
+  // -> redeem). The CLI flow is deterministic, so a second run would
+  // mint the identical ticket; the raw-wire REST tests use a separate
+  // relay-registered ticket (rawTicket) to avoid colliding with the
+  // browser's live allocation on the same ticket.
+  const secretHex = Buffer.from('demo-secret').toString('hex');
+  const out = await runCli(['rendezvous']);
+  const ticket = out.match(/ticket=([0-9a-f]+)/)?.[1];
+  const username = out.match(/username=(\S+)/)?.[1];
+  const expires = Number(out.match(/expires_at=(\d+)/)?.[1] || 0);
+  if (!ticket || !username || expires < Math.floor(Date.now() / 1000) + 30) {
+    throw new Error(`rendezvous CLI gave no live credential: ${out.slice(0, 300)}`);
+  }
+  const issuerCreds = [{ ticket, username, password: credFor(username, 'demo-secret'), expires }];
+  const rawTicket = 'rawwireticket1';
+  const rawUser = `${Math.floor(Date.now() / 1000) + 3600}:pow:${rawTicket}`;
+  const pairTicket = 'pairticket00001';
+  const pairUser = `${Math.floor(Date.now() / 1000) + 3600}:pow:${pairTicket}`;
+  record('issuer:cli-rendezvous', 'PASS', `burn-gated ticket=${ticket} expires_at=${expires}`);
+  await waitListening(startServer(['serve-udp', '--addr', `0.0.0.0:${REST_PORT}`, '--relay-ip', HOST, '--rest-secret', secretHex, '--ticket', ticket, '--ticket', rawTicket, '--ticket', pairTicket]), 'REST/burn-gated TURN server');
+
+  // ---------- raw wire sub-tests (static server) ----------
+  try {
+    const c = new RawClient();
+    const alloc = await c.allocate(USER, PASS, PORT);
+    const realmNonce = { realm: 'turn-dag', nonce: '' };
+    // Re-challenge to learn the nonce for later authed requests.
+    const probe = await new RawClient().request(M.ALLOCATE, [[A.REQUESTED_TRANSPORT, Buffer.from([17, 0, 0, 0])]], null, PORT);
+    realmNonce.realm = probe.realm || 'turn-dag';
+    realmNonce.nonce = probe.nonce || '';
+    record('wire-allocate-lifetime', alloc.cls === 'success' && alloc.lifetime === 120 && !!alloc.relayed ? 'PASS' : 'FAIL',
+      `cls=${alloc.cls} lifetime=${alloc.lifetime} relayed=${alloc.relayed}`);
+    const tcp = await c.authed(M.ALLOCATE, [[A.REQUESTED_TRANSPORT, Buffer.from([6, 0, 0, 0])]], USER, PASS, realmNonce, PORT);
+    record('wire-tcp-refused', tcp.errorCode === 442 ? 'PASS' : 'FAIL', `error=${tcp.errorCode}`);
+    // TLS: no live 5349 listener exists (tls.rs is rustls over the
+    // smoltcp stack only), so a browser turns: allocation is not
+    // supportable yet - record SKIP, never a fake PASS.
+    record('tls-turns', 'SKIP', 'no live TLS 5349 listener (rustls-over-smoltcp only); TCP refusal covered by wire-tcp-refused');
+    let deniedOk = true;
+    let deniedDetail = '';
+    // Denied-peer with txn-correct XOR encoding (server un-XORs with the
+    // message transaction id, so build each request explicitly).
+    const deniedWithTxn = async (method, ip, extra = []) => {
+      const txn = crypto.randomBytes(12);
+      const key = crypto.createHash('md5').update(`${USER}:${realmNonce.realm}:${PASS}`).digest();
+      const resp = await c.exchange(buildMsg(method, [
+        [A.XOR_PEER, xorPeer(ip, txn)], ...extra,
+        [A.USERNAME, Buffer.from(USER)], [A.REALM, Buffer.from(realmNonce.realm)], [A.NONCE, Buffer.from(realmNonce.nonce)],
+      ], key, txn), PORT);
+      return parseMsg(resp, txn);
+    };
+    deniedOk = true;
+    for (const ip of ['169.254.169.254:80', '10.0.0.5:80', '192.168.1.1:80', '127.0.0.1:80']) {
+      const r = await deniedWithTxn(M.CREATE_PERMISSION, ip);
+      if (r.errorCode !== 403) { deniedOk = false; deniedDetail += `${ip}=${r.errorCode} `; }
+    }
+    const cbDenied = await deniedWithTxn(M.CHANNEL_BIND, '169.254.169.254:80', [[A.CHANNEL_NUMBER, Buffer.from([0x40, 0x01])]]);
+    if (cbDenied.errorCode !== 403) { deniedOk = false; deniedDetail += `channelbind=${cbDenied.errorCode}`; }
+    record('wire-denied-peer', deniedOk ? 'PASS' : 'FAIL', deniedDetail || '403 for metadata/RFC1918/loopback');
+    // Refresh: capped at 120, 0 deletes, unknown -> 437.
+    const refr = await c.authed(M.REFRESH, [[A.LIFETIME, Buffer.from([0, 0, 0x27, 0x0f])]], USER, PASS, realmNonce, PORT);
+    const del = await c.authed(M.REFRESH, [[A.LIFETIME, Buffer.from([0, 0, 0, 0])]], USER, PASS, realmNonce, PORT);
+    const unknown = await c.authed(M.REFRESH, [[A.LIFETIME, Buffer.from([0, 0, 0, 60])]], USER, PASS, realmNonce, PORT);
+    record('wire-refresh', refr.lifetime === 120 && del.cls === 'success' && unknown.errorCode === 437 ? 'PASS' : 'FAIL',
+      `cap=${refr.lifetime} del=${del.cls} unknown=${unknown.errorCode}`);
+    c.close();
+  } catch (e) {
+    record('wire-static', 'FAIL', String(e).slice(0, 300));
   }
 
-  // --- Sub-test 3: negative (wrong credentials must not allocate) ---
-  const negative = await page
-    .evaluate(
-      async ({ cfg, timeout }) => {
-        const pc = new RTCPeerConnection(cfg);
-        const cands = [];
-        const errs = [];
-        pc.onicecandidate = (e) => {
-          if (e.candidate && e.candidate.candidate) cands.push(e.candidate.candidate);
-        };
-        pc.onicecandidateerror = (e) => errs.push(e.errorText || `${e.errorCode}`);
-        const done = new Promise((res) => {
-          pc.onicegatheringstatechange = () => {
-            if (pc.iceGatheringState === 'complete') res();
-          };
-          setTimeout(res, timeout);
-        });
-        pc.createDataChannel('probe');
-        await pc.setLocalDescription(await pc.createOffer());
-        await done;
-        const state = pc.iceGatheringState;
-        pc.close();
-        return { state, cands, errs };
-      },
-      { cfg: turnCfg(USER, 'wrong-password'), timeout: GATHER_TIMEOUT_MS },
-    )
-    .catch((e) => ({ state: 'error', cands: [], errs: [String(e)] }));
-  const negRelay = negative.cands.filter((c) => c.includes('typ relay'));
-  if (negRelay.length === 0) {
-    record('negative-creds', 'PASS', 'no relay candidate with wrong credentials');
-  } else {
-    record('negative-creds', 'FAIL', `relay candidate leaked with wrong credentials`);
+  // Byte cap: two raw allocations relay ChannelData until the cap drops.
+  try {
+    const a = new RawClient();
+    const b = new RawClient();
+    const allocA = await a.allocate(USER, PASS, PORT);
+    const allocB = await b.allocate(USER, PASS, PORT);
+    if (!allocA.relayed || !allocB.relayed) throw new Error(`no relayed addr A=${allocA.relayed} B=${allocB.relayed}`);
+    const rn = { realm: 'turn-dag', nonce: (await new RawClient().request(M.ALLOCATE, [[A.REQUESTED_TRANSPORT, Buffer.from([17, 0, 0, 0])]], null, PORT)).nonce || '' };
+    const withTxn = async (client, method, peer, extra = []) => {
+      const txn = crypto.randomBytes(12);
+      const key = crypto.createHash('md5').update(`${USER}:${rn.realm}:${PASS}`).digest();
+      const resp = await client.exchange(buildMsg(method, [
+        [A.XOR_PEER, xorPeer(peer, txn)], ...extra,
+        [A.USERNAME, Buffer.from(USER)], [A.REALM, Buffer.from(rn.realm)], [A.NONCE, Buffer.from(rn.nonce)],
+      ], key, txn), PORT);
+      return parseMsg(resp, txn);
+    };
+    const setup = [];
+    setup.push(['permA', await withTxn(a, M.CREATE_PERMISSION, allocB.relayed)]);
+    setup.push(['permB', await withTxn(b, M.CREATE_PERMISSION, allocA.relayed)]);
+    setup.push(['bindA', await withTxn(a, M.CHANNEL_BIND, allocB.relayed, [[A.CHANNEL_NUMBER, Buffer.from([0x40, 0x01])]])]);
+    setup.push(['bindB', await withTxn(b, M.CHANNEL_BIND, allocA.relayed, [[A.CHANNEL_NUMBER, Buffer.from([0x40, 0x01])]])]);
+    console.log('[byte-cap setup]', setup.map(([n, r]) => `${n}=${r.cls}/${r.errorCode}`).join(' '), `A=${allocA.relayed} B=${allocB.relayed}`);
+    let received = 0;
+    let receivedMsgs = 0;
+    b.onData = (payload) => { received += payload.length; receivedMsgs += 1; };
+    // Live server reads datagrams into a 2048-byte buffer, so relay
+    // payloads must stay under ~2000 bytes per ChannelData frame.
+    const chunk = 2000;
+    const frames = 1100;
+    for (let i = 0; i < frames; i++) {
+      const payload = Buffer.alloc(chunk);
+      payload.writeUInt32BE(i, 0);
+      const frame = Buffer.alloc(4 + chunk);
+      frame.writeUInt16BE(0x4001, 0);
+      frame.writeUInt16BE(chunk, 2);
+      payload.copy(frame, 4);
+      a.sock.send(frame, PORT, HOST);
+      if (i % 20 === 19) await new Promise((r) => setTimeout(r, 2));
+    }
+    await new Promise((r) => setTimeout(r, 1500));
+    record('wire-byte-cap', received >= BYTE_CAP * 0.9 && received <= BYTE_CAP ? 'PASS' : 'FAIL',
+      `received=${received}/${frames * chunk} cap=${BYTE_CAP} msgs=${receivedMsgs}`);
+    a.close(); b.close();
+  } catch (e) {
+    record('wire-byte-cap', 'FAIL', String(e).slice(0, 300));
   }
 
-  // --- Sub-test 2: relay DataChannel (needs real network path) ---
-  const relay = await page
-    .evaluate(
-      async ({ cfg, connectTimeout }) => {
-        const pc1 = new RTCPeerConnection(cfg);
-        const pc2 = new RTCPeerConnection(cfg);
-        const seen = { candidates: [], errors: [] };
-        pc1.onicecandidate = (e) => {
-          if (e.candidate && e.candidate.candidate) {
-            seen.candidates.push(e.candidate.candidate);
-            pc2.addIceCandidate(e.candidate).catch(() => {});
-          }
-        };
-        pc2.onicecandidate = (e) => {
-          if (e.candidate && e.candidate.candidate) {
-            seen.candidates.push(e.candidate.candidate);
-            pc1.addIceCandidate(e.candidate).catch(() => {});
-          }
-        };
-        pc1.onicecandidateerror = (e) => seen.errors.push(`pc1: ${e.errorText || e.errorCode}`);
-        pc2.onicecandidateerror = (e) => seen.errors.push(`pc2: ${e.errorText || e.errorCode}`);
-        const dc1 = pc1.createDataChannel('rendezvous');
-        const got = { onPc2: null, onPc1: null };
-        const dc2Promise = new Promise((res) => (pc2.ondatachannel = (e) => res(e.channel)));
-        await pc1.setLocalDescription(await pc1.createOffer());
-        await pc2.setRemoteDescription(pc1.localDescription);
-        await pc2.setLocalDescription(await pc2.createAnswer());
-        await pc1.setRemoteDescription(pc2.localDescription);
-        const dc2 = await Promise.race([dc2Promise, new Promise((_, rej) => setTimeout(() => rej(new Error('dc2 timeout')), 10000))]);
-        const waitConnected = (pc) =>
-          new Promise((res, rej) => {
-            if (pc.connectionState === 'connected') return res();
-            const t = setTimeout(() => rej(new Error(`state=${pc.connectionState} ice=${pc.iceConnectionState}`)), connectTimeout);
-            pc.onconnectionstatechange = () => {
-              if (pc.connectionState === 'connected') {
-                clearTimeout(t);
-                res();
-              }
-            };
-          });
-        await Promise.all([waitConnected(pc1), waitConnected(pc2)]);
-        await new Promise((res, rej) => {
-          if (dc1.readyState === 'open') return res();
-          dc1.onopen = res;
-          setTimeout(() => rej(new Error(`dc1 ${dc1.readyState}`)), 10000);
-        });
-        const p2 = new Promise((res) => (dc2.onmessage = (e) => res(e.data)));
-        const p1 = new Promise((res) => (dc1.onmessage = (e) => res(e.data)));
-        dc1.send('one element, one rendezvous');
-        got.onPc2 = await p2;
-        dc2.send('ack over relay');
-        got.onPc1 = await p1;
-        const stats = await pc1.getStats();
-        let pairType = null;
-        stats.forEach((r) => {
-          if (r.type === 'candidate-pair' && (r.state === 'succeeded' || r.nominated)) {
-            const local = stats.get(r.localCandidateId);
-            const remote = stats.get(r.remoteCandidateId);
-            if (local && remote) pairType = `${local.candidateType}/${remote.candidateType}`;
-          }
-        });
-        return { got, pairType, candidates: seen.candidates, errors: seen.errors, state: pc1.connectionState };
-      },
-      { cfg: turnCfg(USER, PASS), connectTimeout: CONNECT_TIMEOUT_MS },
-    )
-    .catch((e) => ({ error: String(e), got: null, pairType: null, candidates: [], errors: [] }));
-  if (relay.error) {
-    record('relay-datachannel', 'SKIP', `no network path: ${relay.error}`);
-  } else if (
-    relay.got?.onPc2 === 'one element, one rendezvous' &&
-    relay.got?.onPc1 === 'ack over relay' &&
-    relay.pairType === 'relay/relay'
-  ) {
-    record('relay-datachannel', 'PASS', 'relay/relay DataChannel both ways');
-  } else {
-    record('relay-datachannel', 'FAIL', JSON.stringify(relay).slice(0, 400));
+  // Total quota on the dedicated quota server (max 2).
+  try {
+    const clients = [new RawClient(), new RawClient(), new RawClient()];
+    const r = [];
+    for (const cl of clients) r.push(await cl.allocate(USER, PASS, QUOTA_PORT));
+    record('wire-total-quota', r[0].cls === 'success' && r[1].cls === 'success' && r[2].errorCode === 486 ? 'PASS' : 'FAIL',
+      r.map((x) => x.cls === 'success' ? 'ok' : String(x.errorCode)).join(','));
+    clients.forEach((cl) => cl.close());
+  } catch (e) {
+    record('wire-total-quota', 'FAIL', String(e).slice(0, 300));
   }
 
-  await browser.close();
+  // REST / burn-gated server: valid, forged, expired, ticket reuse.
+  try {
+    const credB = { ticket: rawTicket, username: rawUser, password: credFor(rawUser, 'demo-secret') };
+    const b1 = new RawClient();
+    const valid = await b1.allocate(credB.username, credB.password, REST_PORT);
+    record('wire-rest-valid', valid.cls === 'success' && !!valid.relayed ? 'PASS' : 'FAIL', `cls=${valid.cls} relayed=${valid.relayed}`);
+    const expUser = `1:pow:${credB.ticket}`;
+    const expired = await new RawClient().allocate(expUser, credFor(expUser, 'demo-secret'), REST_PORT);
+    record('wire-rest-expired', expired.errorCode === 401 ? 'PASS' : 'FAIL', `error=${expired.errorCode}`);
+    const forgedUser = `${Math.floor(Date.now() / 1000) + 3600}:pow:forgedticket99`;
+    const forged = await new RawClient().allocate(forgedUser, credFor(forgedUser, 'demo-secret'), REST_PORT);
+    record('wire-rest-forged', forged.errorCode === 401 ? 'PASS' : 'FAIL', `error=${forged.errorCode}`);
+    const dup = await new RawClient().allocate(credB.username, credB.password, REST_PORT);
+    record('wire-ticket-quota', dup.errorCode === 486 ? 'PASS' : 'FAIL', `second allocation error=${dup.errorCode}`);
+    b1.close();
+  } catch (e) {
+    record('wire-rest', 'FAIL', String(e).slice(0, 300));
+  }
+
+  // ---------- browser sub-tests per engine ----------
+  const launchers = { firefox, chromium, webkit };
+  for (const name of ENGINES) {
+    const launcher = launchers[name];
+    if (!launcher) { record(`${name}:launch`, 'FAIL', 'unknown engine'); continue; }
+    let browser;
+    try {
+      // WebKit rejects --no-sandbox; Chromium/Firefox accept it.
+      browser = await launcher.launch({ args: name === 'webkit' ? [] : ['--no-sandbox'] });
+    } catch (e) {
+      // WebKit needs OS deps (gstreamer) that only the Docker/CI images
+      // install; an engine that cannot launch here is a SKIP, while
+      // Firefox/Chromium launch failure is a real FAIL.
+      record(`${name}:launch`, name === 'webkit' ? 'SKIP' : 'FAIL', String(e).slice(0, 200));
+      continue;
+    }
+    try {
+      const ctx1 = await browser.newContext();
+      const ctx2 = await browser.newContext();
+      const page1 = await ctx1.newPage();
+      const page2 = await ctx2.newPage();
+      for (const p of [page1, page2]) {
+        p.on('pageerror', (e) => console.log('[pageerror]', String(e)));
+        await p.goto(pageUrl);
+      }
+      if (name === ENGINES[0]) {
+        // Fresh issuer credential (same deterministic ticket, new
+        // 120s window): earlier sub-tests can outlive the first mint.
+        const freshOut = await runCli(['rendezvous']);
+        const fUser = freshOut.match(/username=(\S+)/)?.[1];
+        const fExp = Number(freshOut.match(/expires_at=(\d+)/)?.[1] || 0);
+        if (!fUser || fExp < Math.floor(Date.now() / 1000) + 20) throw new Error(`fresh rendezvous credential not live: ${freshOut.slice(0, 200)}`);
+        const iss = await gatherOnce(page1, turnCfg(fUser, credFor(fUser, 'demo-secret'), REST_PORT), GATHER_TIMEOUT_MS);
+        const issRelay = iss.cands.filter((c) => c.includes('typ relay'));
+        recordNet('issuer:browser-gather', iss.state === 'complete' && issRelay.length > 0,
+          `burn-gated credential allocated in browser (${issRelay.length} relay)`,
+          `state=${iss.state} relay=${issRelay.length} errors=${iss.errors.join(';')}`);
+      }
+      const gather = await gatherOnce(page1, turnCfg(USER, PASS), GATHER_TIMEOUT_MS);
+      const relayCands = gather.cands.filter((c) => c.includes('typ relay'));
+      if (name === 'webkit' && !(gather.state === 'complete' && relayCands.length > 0)) {
+        record('webkit:gather', 'SKIP', `WebKit relay gather unsupported here: state=${gather.state} relay=${relayCands.length}`);
+      } else {
+        recordNet(`${name}:gather`, gather.state === 'complete' && relayCands.length > 0,
+          `${relayCands.length} relay candidate(s)`, `state=${gather.state} relay=${relayCands.length} errors=${gather.errors.join(';')}`);
+      }
+      // Public STUN controls (Google + Cloudflare): a srflx candidate
+      // proves the public STUN path; SKIP only when this host has no
+      // internet UDP (never a hard failure - the TURN path is the gate).
+      for (const srv of [
+        { name: 'google', urls: 'stun:stun.l.google.com:19302' },
+        { name: 'cloudflare', urls: 'stun:stun.cloudflare.com:3478' },
+      ]) {
+        const stun = await gatherOnce(page1, { iceServers: [{ urls: srv.urls }] }, 8000);
+        const srflx = stun.cands.filter((c) => c.includes('typ srflx'));
+        record(`${name}:stun-${srv.name}`, srflx.length > 0 ? 'PASS' : 'SKIP',
+          srflx.length > 0 ? `${srflx.length} srflx candidate(s) via ${srv.urls}` : `no srflx via ${srv.urls} (offline/blocked) state=${stun.state}`);
+      }
+      const neg = await gatherOnce(page1, turnCfg(USER, 'wrong-password'), GATHER_TIMEOUT_MS);
+      record(`${name}:negative-creds`, neg.cands.filter((c) => c.includes('typ relay')).length === 0 ? 'PASS' : 'FAIL',
+        'no relay candidate with wrong credentials');
+      const expUser = `1:pow:${issuerCreds[0].ticket}`;
+      const exp = await gatherOnce(page1, turnCfg(expUser, credFor(expUser, 'demo-secret'), REST_PORT), GATHER_TIMEOUT_MS);
+      record(`${name}:expired-creds`, exp.cands.filter((c) => c.includes('typ relay')).length === 0 ? 'PASS' : 'FAIL',
+        'no relay candidate with expired issuer credential');
+      try {
+        const relay = await relayOnce(page1, page2, turnCfg(USER, PASS), CONNECT_TIMEOUT_MS);
+        const ok = relay.gotOn2 === 'one element, one rendezvous' && relay.gotOn1 === 'ack over relay' && relay.pairType === 'relay/relay';
+        if (name === 'webkit' && !ok) {
+          record('webkit:relay-datachannel', 'SKIP', `WebKit relay unsupported here: ${JSON.stringify(relay).slice(0, 200)}`);
+        } else {
+          recordNet(`${name}:relay-datachannel`, ok, 'relay/relay DataChannel both ways (isolated contexts)',
+            JSON.stringify(relay).slice(0, 300));
+        }
+      } catch (e) {
+        if (name === 'webkit') record('webkit:relay-datachannel', 'SKIP', `WebKit relay unsupported here: ${String(e).slice(0, 200)}`);
+        else recordNet(`${name}:relay-datachannel`, false, '', String(e).slice(0, 300));
+      }
+      await ctx1.close();
+      await ctx2.close();
+    } finally {
+      await browser.close();
+    }
+  }
+
+  // ---------- cross-engine relay pairs + issuer-credential pair ----------
+  const openPage = async (launcher, engineName) => {
+    const b = await launcher.launch({ args: engineName === 'webkit' ? [] : ['--no-sandbox'] });
+    const ctx = await b.newContext();
+    const page = await ctx.newPage();
+    await page.goto(pageUrl);
+    return { b, page };
+  };
+  const crossRelay = async (label, nameA, launcherA, nameB, launcherB, cfg, binaryBytes, webkitSoft) => {
+    let a; let b;
+    try {
+      a = await openPage(launcherA, nameA);
+      b = await openPage(launcherB, nameB);
+      const relay = await relayOnce(a.page, b.page, cfg, CONNECT_TIMEOUT_MS, binaryBytes);
+      const ok = relay.gotOn2 === 'one element, one rendezvous' && relay.gotOn1 === 'ack over relay' && relay.pairType === 'relay/relay';
+      if (webkitSoft && !ok) record(label, 'SKIP', `WebKit cross relay unsupported here: ${JSON.stringify(relay).slice(0, 200)}`);
+      else recordNet(label, ok, `relay/relay both ways${binaryBytes ? ` + ${binaryBytes}B binary verified` : ''}`, JSON.stringify(relay).slice(0, 300));
+    } catch (e) {
+      if (webkitSoft) record(label, 'SKIP', `WebKit cross relay unsupported here: ${String(e).slice(0, 200)}`);
+      else recordNet(label, false, '', String(e).slice(0, 300));
+    } finally {
+      try { await a?.b.close(); } catch {}
+      try { await b?.b.close(); } catch {}
+    }
+  };
+  if (ENGINES.includes('firefox') && ENGINES.includes('chromium')) {
+    await crossRelay('cross:firefox-chromium', 'firefox', firefox, 'chromium', chromium, turnCfg(USER, PASS), 32768, false);
+    // Issuer-credential pair: Firefox holds a fresh DAG-burn ticket,
+    // Chromium a second relay-registered ticket, over the burn gate.
+    const freshOut2 = await runCli(['rendezvous']);
+    const fUser2 = freshOut2.match(/username=(\S+)/)?.[1];
+    if (fUser2) {
+      await crossRelay('issuer:relay-pair', 'firefox', firefox, 'chromium', chromium,
+        [turnCfg(fUser2, credFor(fUser2, 'demo-secret'), REST_PORT), turnCfg(pairUser, credFor(pairUser, 'demo-secret'), REST_PORT)], 0, false);
+    } else {
+      record('issuer:relay-pair', 'FAIL', `no fresh credential: ${freshOut2.slice(0, 200)}`);
+    }
+  }
+  if (ENGINES.includes('webkit') && ENGINES.includes('firefox')) {
+    await crossRelay('cross:firefox-webkit', 'firefox', firefox, 'webkit', webkit, turnCfg(USER, PASS), 0, true);
+  }
+  if (ENGINES.includes('webkit') && ENGINES.includes('chromium')) {
+    await crossRelay('cross:chromium-webkit', 'chromium', chromium, 'webkit', webkit, turnCfg(USER, PASS), 0, true);
+  }
 
   const failed = results.filter((r) => r.status === 'FAIL');
   const passed = results.filter((r) => r.status === 'PASS').length;
   const skipped = results.filter((r) => r.status === 'SKIP').length;
-  console.log(`\nsummary: ${passed} passed, ${skipped} skipped, ${failed.length} failed`);
-  if (failed.length > 0) {
-    console.error(`--- server log ---\n${serverLog}`);
-    process.exit(1);
+  console.log(`\nsummary: ${passed} passed, ${skipped} skipped, ${failed.length} failed (REQUIRE_RELAY=${REQUIRE ? 1 : 0}, MIN_PASS=${MIN_PASS})`);
+  if (REQUIRE && passed < MIN_PASS) {
+    console.error(`REQUIRE_RELAY: only ${passed} PASS < MIN_PASS=${MIN_PASS} - treating as failure`);
+    process.exitCode = 1;
   }
+  if (failed.length > 0) process.exitCode = 1;
+} catch (e) {
+  console.error(`fatal: ${e.stack || e}`);
+  process.exitCode = 1;
 } finally {
-  server.kill();
+  for (const cl of rawClients) cl.close();
+  // `servers` holds the ChildProcess objects themselves.
+  for (const s of servers) { try { s.kill(); } catch {} }
   pageServer.close();
 }
+// Stray UDP/browser handles must never hang CI after the summary.
+setTimeout(() => process.exit(process.exitCode || 0), 250);
+

@@ -6,6 +6,11 @@
 #   docker run --rm turn-dag test|build|ci|run
 #   docker run --rm -it turn-dag tool
 #   docker build --target ci -t turn-dag:ci .
+#   docker build --target browser -t turn-dag:browser .
+#   docker run --rm --network host turn-dag:browser
+#     (host network so the container's LAN IP is reachable by the
+#     in-container browsers; sub-tests that need a real TURN path
+#     SKIP elsewhere instead of failing)
 ARG RUST_VERSION=1.87
 
 # ---------- base: Rust toolchain only (no Node/Python runtimes) ----------
@@ -49,6 +54,29 @@ CMD ["run"]
 # ---------- ci = build + test, nothing else ----------
 FROM test AS ci
 RUN echo "== ci == build+test: PASS"
+
+# ---------- browser (Playwright WebRTC relay tests, in-container) ----------
+FROM rust:${RUST_VERSION}-bookworm AS browser
+ENV DEBIAN_FRONTEND=noninteractive CARGO_TERM_COLOR=never
+ARG NODE_VERSION=22.14.0
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates git file iproute2 curl xz-utils \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "$(dpkg --print-architecture)" in arm64) NODE_ARCH=arm64 ;; amd64) NODE_ARCH=x64 ;; *) echo "unsupported arch" && exit 1 ;; esac \
+    && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
+       | tar -xJ -C /usr/local --strip-components=1 \
+    && node --version && npm --version
+RUN rustup component add clippy rustfmt
+WORKDIR /work
+COPY . /work
+RUN chmod +x scripts/*.sh \
+    && cargo build -p turn-dag-node \
+    && cd /work/tests/browser && npm ci --no-audit --no-fund \
+    && npx playwright install --with-deps firefox chromium webkit
+# The in-container TURN server binds 0.0.0.0; browsers must reach it
+# via the container's primary LAN/bridge IP (loopback TURN is
+# policy-blocked by headless Firefox).
+CMD ["bash", "scripts/browser-test.sh"]
 
 # Default target: runnable node image.
 FROM run AS final

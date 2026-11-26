@@ -179,6 +179,46 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 - Add GitHub Actions only as a thin wrapper around Docker (checkout,
   build, run). Do not put build/test logic in YAML.
 
+## Browser e2e (Playwright) — gaps filled 2026-11-25
+
+- `tests/browser/run.mjs` now runs Firefox **and** Chromium, plus raw
+  UDP/STUN wire sub-tests against the live `serve-udp` servers:
+  allocate lifetime 120s, TCP refused 442, denied-peer 403
+  (169.254.169.254/RFC1918/loopback), refresh cap/delete/437,
+  byte-cap (exactly 983×2000B = 1,966,000B delivered, then drop),
+  total-quota 486 (`--total-quota`), one live allocation per issuer
+  ticket 486, REST valid/forged/expired (401), expired + negative
+  browser credentials, public STUN controls (Google
+  `stun.l.google.com:19302` + Cloudflare `stun.cloudflare.com:3478`,
+  srflx candidates in both engines), and a real burn→challenge/PoW→
+  redeem→ticket→browser Allocate flow (`turn-dag-node rendezvous`
+  now mints credentials with wall-clock expiry). `tls-turns` SKIPs:
+  no live 5349 listener exists yet (rustls-over-smoltcp only).
+- Hard gate: `scripts/browser-test.sh` (Docker `--network host`)
+  sets `REQUIRE_RELAY=1 MIN_PASS=10`; gather/relay/issuer failures
+  are FAIL there, SKIPs elsewhere (GitHub loopback job).
+- Three live-wire bugs found by the new suite and fixed in
+  `crates/turn-dag-turn/src/wire.rs`: STUN class bits were swapped
+  (Allocate success went out as 0x0013, an indication, so browsers
+  retransmitted forever), FINGERPRINT now follows RFC 8489 §14.7
+  (CRC excluding the attribute), and REST-authenticated responses
+  are MESSAGE-INTEGRITY signed like static ones. Regression tests:
+  `stun_type_wire_values_match_rfc8489`,
+  `signed_allocate_response_carries_valid_fingerprint`,
+  `rest_auth_accepts_issuer_credential_and_rejects_expired`,
+  `total_quota_486_and_ticket_single_allocation`.
+- Cross-engine rendezvous: Firefox↔Chromium (plus 32 KiB binary
+  payload, checksum-verified), Firefox↔WebKit, Chromium↔WebKit, and
+  WebKit↔WebKit all pass relay/relay in Docker; an issuer-credential
+  pair (fresh DAG-burn ticket + second registered ticket, burn-gated
+  relay) also passes. WebKit launches without `--no-sandbox`
+  (it rejects the flag) and SKIPs on hosts lacking its OS deps.
+  Still uncovered: >2-peer meshes and the 90s `restartIce()` path.
+- Verified: `cargo test --workspace` (94 tests), clippy, fmt,
+  `docker build --target ci`, and
+  `docker build --target browser && docker run --rm --network host turn-dag:browser`
+  (34 passed, 1 skipped — tls-turns — 0 failed).
+
 ## Open questions — ask John before guessing
 
 - Mint issuance: v1 SHIPS with 10,000/epoch (configurable via

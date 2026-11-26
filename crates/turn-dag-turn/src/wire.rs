@@ -49,10 +49,14 @@ pub enum Class {
     Error,
 }
 pub fn encode_type(method: u16, class: Class) -> u16 {
+    // RFC 8489 §6: class LSB at bit 4, MSB at bit 8. Request=00,
+    // Indication=01, Success=10, Error=11 - so Allocate success is
+    // 0x0103, not 0x0013 (an indication). Swapping these makes real
+    // browsers ignore every success response and retransmit.
     let (b4, b8) = match class {
         Class::Request => (0, 0),
-        Class::Indication => (0, 1),
-        Class::Success => (1, 0),
+        Class::Indication => (1, 0),
+        Class::Success => (0, 1),
         Class::Error => (1, 1),
     };
     (method & 0x000F) | ((method & 0x0070) << 1) | ((method & 0x0F80) << 2) | (b4 << 4) | (b8 << 8)
@@ -61,8 +65,8 @@ pub fn decode_type(t: u16) -> (u16, Class) {
     let method = (t & 0x000F) | ((t >> 1) & 0x0070) | ((t >> 2) & 0x0F80);
     let class = match ((t >> 4) & 1, (t >> 8) & 1) {
         (0, 0) => Class::Request,
-        (0, 1) => Class::Indication,
-        (1, 0) => Class::Success,
+        (1, 0) => Class::Indication,
+        (0, 1) => Class::Success,
         _ => Class::Error,
     };
     (method, class)
@@ -242,8 +246,11 @@ pub fn sign_wire(mut msg: StunMessage, integrity: Option<&[u8; 16]>) -> Vec<u8> 
     head[2..4].copy_from_slice(&((mi_at - 20 + 24) as u16).to_be_bytes());
     let mac = hmac_sha1(k, &head);
     bytes[mi_at + 4..mi_at + 24].copy_from_slice(&mac);
-    // FINGERPRINT last: CRC32 over the final message (field zeroed).
-    let fp = (crc32(&bytes) ^ 0x5354_554E).to_be_bytes();
+    // FINGERPRINT last (RFC 8489 §14.7): CRC32 over the message up
+    // to (but excluding) the FINGERPRINT attribute itself. Browsers
+    // reject Allocate successes whose fingerprint covers the zeroed
+    // attribute and silently retransmit the request.
+    let fp = (crc32(&bytes[..n - 8]) ^ 0x5354_554E).to_be_bytes();
     bytes[n - 4..n].copy_from_slice(&fp);
     bytes
 }
@@ -315,6 +322,10 @@ struct Allocation {
     permissions: HashSet<IpAddr>,
     channels: HashMap<u16, SocketAddr>,
     bytes: u64,
+    /// Issuer ticket (`expiry:pow:<ticket>`) that created this
+    /// allocation, when REST/burn auth is in use. One live allocation
+    /// per ticket (issuer user-quota=1 at the wire).
+    ticket: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -366,6 +377,8 @@ pub struct TurnServer {
     /// (tickets are minted only after a confirmed burn).
     burn_tickets: Option<std::collections::HashSet<String>>,
     nonce: String,
+    /// `total-quota`: max concurrent allocations (spec: 200).
+    max_allocations: usize,
 }
 impl TurnServer {
     pub fn new(server_ip: IpAddr) -> Self {
@@ -380,7 +393,13 @@ impl TurnServer {
             rest_secret: None,
             burn_tickets: None,
             nonce: String::new(),
+            max_allocations: 200,
         }
+    }
+    /// Override `total-quota` (default 200, spec coturn tuning).
+    pub fn with_max_allocations(mut self, max: usize) -> Self {
+        self.max_allocations = max;
+        self
     }
     /// Verify issuer-issued REST credentials (username=expiry:pow:<ticket>,
     /// HMAC-SHA1 password) instead of static long-term credentials.
@@ -531,11 +550,12 @@ impl TurnServer {
         out
     }
     fn respond(&self, msg: StunMessage, req: &StunMessage) -> HandleOutcome {
-        // Attach integrity if the request was authenticated.
-        if !self.credentials.is_empty() {
-            if let Some(key) = self.auth_key(req) {
-                return HandleOutcome::Response(sign_integrity(msg, &key));
-            }
+        // Attach integrity if the request was authenticated, under
+        // either auth mode. REST (issuer-credential) responses were
+        // previously unsigned - browsers ignore unauthenticated
+        // Allocate successes and retransmit the request forever.
+        if let Some(key) = self.auth_key(req) {
+            return HandleOutcome::Response(sign_integrity(msg, &key));
         }
         HandleOutcome::Response(msg.encode())
     }
@@ -596,6 +616,20 @@ impl TurnServer {
             );
             return self.respond(r, msg);
         }
+        // total-quota (486 when full) + one live allocation per
+        // issuer ticket. Static-credential allocations are exempt
+        // from the per-ticket rule (one user may hold many PCs).
+        let ticket = msg
+            .attr(attr_type::USERNAME)
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .and_then(crate::parse_username)
+            .map(|(_, t)| t);
+        if ticket.is_some() && self.allocations.values().any(|a| a.ticket == ticket) {
+            return self.respond(err_response(msg, 486, "Allocation Quota Reached"), msg);
+        }
+        if self.allocations.len() >= self.max_allocations {
+            return self.respond(err_response(msg, 486, "Allocation Quota Reached"), msg);
+        }
         let relayed = SocketAddr::new(self.server_ip, self.next_port);
         self.next_port = self.next_port.wrapping_add(1).max(49152);
         self.allocations.insert(
@@ -606,6 +640,7 @@ impl TurnServer {
                 permissions: HashSet::new(),
                 channels: HashMap::new(),
                 bytes: 0,
+                ticket,
             },
         );
         let mut r = StunMessage::new(method::ALLOCATE, Class::Success, msg.transaction);
@@ -838,6 +873,27 @@ mod tests {
     }
 
     #[test]
+    fn stun_type_wire_values_match_rfc8489() {
+        // Exact on-the-wire type values (RFC 8489 §6 / RFC 8656):
+        // browsers reject success responses encoded as indications.
+        assert_eq!(encode_type(method::ALLOCATE, Class::Success), 0x0103);
+        assert_eq!(encode_type(method::ALLOCATE, Class::Error), 0x0113);
+        assert_eq!(encode_type(method::ALLOCATE, Class::Request), 0x0003);
+        assert_eq!(encode_type(method::BINDING, Class::Success), 0x0101);
+        assert_eq!(encode_type(method::SEND, Class::Indication), 0x0016);
+        assert_eq!(encode_type(method::DATA, Class::Indication), 0x0017);
+        for (m, c) in [
+            (method::ALLOCATE, Class::Success),
+            (method::SEND, Class::Indication),
+            (method::REFRESH, Class::Error),
+        ] {
+            assert_eq!(decode_type(encode_type(m, c)), (m, c));
+        }
+        assert_eq!(decode_type(0x0103), (method::ALLOCATE, Class::Success));
+        assert_eq!(decode_type(0x0016), (method::SEND, Class::Indication));
+    }
+
+    #[test]
     fn stun_codec_roundtrip_and_padding() {
         let bytes = allocate_req();
         let m = StunMessage::decode(&bytes).unwrap();
@@ -887,6 +943,44 @@ mod tests {
         assert_eq!(r.class, Class::Error);
         assert_eq!(error_code(&r), Some(442));
         assert_eq!(s.allocation_count(), 0);
+    }
+
+    #[test]
+    fn total_quota_486_and_ticket_single_allocation() {
+        let mut s = server().with_max_allocations(2);
+        let c2: SocketAddr = "203.0.113.8:5000".parse().unwrap();
+        let c3: SocketAddr = "203.0.113.9:5000".parse().unwrap();
+        assert_eq!(
+            decode_ok(s.handle(&allocate_req(), client(), 0)).class,
+            Class::Success
+        );
+        assert_eq!(
+            decode_ok(s.handle(&allocate_req(), c2, 0)).class,
+            Class::Success
+        );
+        let third = decode_ok(s.handle(&allocate_req(), c3, 0));
+        assert_eq!(error_code(&third), Some(486));
+        assert_eq!(s.allocation_count(), 2);
+        // Same ticket from a second client: 486 even under total quota.
+        let mut s2 = TurnServer::new("198.51.100.1".parse().unwrap())
+            .with_rest_auth(b"quota-secret".to_vec())
+            .with_burn_tickets(vec!["tick1".to_string()]);
+        let alloc_with = |user: &str| {
+            let mut m = StunMessage::new(method::ALLOCATE, Class::Request, txn());
+            m.push_attr(attr_type::REQUESTED_TRANSPORT, vec![17, 0, 0, 0]);
+            m.push_attr(attr_type::USERNAME, user.as_bytes().to_vec());
+            m.push_attr(attr_type::REALM, b"turn-dag".to_vec());
+            m.push_attr(attr_type::NONCE, b"n".to_vec());
+            let pass = crate::credential_password(b"quota-secret", user);
+            sign_wire(m, Some(&integrity_key(user, "turn-dag", &pass)))
+        };
+        let user = "9999999999:pow:tick1";
+        assert_eq!(
+            decode_ok(s2.handle(&alloc_with(user), client(), 100)).class,
+            Class::Success
+        );
+        let dup = decode_ok(s2.handle(&alloc_with(user), c2, 100));
+        assert_eq!(error_code(&dup), Some(486));
     }
 
     #[test]
@@ -997,10 +1091,10 @@ mod tests {
                 let m = StunMessage::decode(&bytes).unwrap();
                 assert_eq!(m.class, Class::Success);
                 let fp = m.attr(attr_type::FINGERPRINT).unwrap();
-                let mut zeroed = bytes.clone();
-                let n = zeroed.len();
-                zeroed[n - 4..n].copy_from_slice(&[0, 0, 0, 0]);
-                let expect = (crc32(&zeroed) ^ 0x5354_554E).to_be_bytes();
+                let n = bytes.len();
+                // RFC 8489 §14.7: CRC over the message up to (but
+                // excluding) the FINGERPRINT attribute itself.
+                let expect = (crc32(&bytes[..n - 8]) ^ 0x5354_554E).to_be_bytes();
                 assert_eq!(fp, expect.as_slice());
                 assert_eq!(bytes[n - 4..n].to_vec(), expect.to_vec());
             }
@@ -1026,6 +1120,16 @@ mod tests {
             HandleOutcome::Response(b) => {
                 let r = StunMessage::decode(&b).unwrap();
                 assert_eq!(r.class, Class::Success, "{r:?}");
+                // REST successes must be signed like static ones, or
+                // browsers ignore them and retransmit.
+                assert!(
+                    r.attr(attr_type::MESSAGE_INTEGRITY).is_some(),
+                    "REST allocate success must carry MESSAGE-INTEGRITY"
+                );
+                assert!(verify_integrity(
+                    &b,
+                    &integrity_key(&username, "turn-dag", &password)
+                ));
             }
             other => panic!("expected allocate success, got {other:?}"),
         }

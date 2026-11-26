@@ -1,12 +1,14 @@
 # Runs the Playwright WebRTC suite against the live Rust TURN server.
-# Sub-tests that need a real network path SKIP gracefully on hosts
-# where ICE is policy-blocked; they PASS where the path exists.
+# GitHub-hosted runners use loopback TURN (policy-blocked in headless
+# browsers), so network sub-tests SKIP there; the hard gate is the
+# Docker --network host job (scripts/browser-test.sh, REQUIRE_RELAY=1,
+# MIN_PASS>=10). Raw-wire and negative sub-tests still FAIL here.
 name: browser-test
 on: [push, pull_request]
 jobs:
   browser:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -15,9 +17,10 @@ jobs:
       - run: cargo build -p turn-dag-node
       - run: npm ci
         working-directory: tests/browser
-      - run: npx playwright install firefox --with-deps
+      - run: npx playwright install firefox chromium webkit --with-deps
         working-directory: tests/browser
       - run: node run.mjs
         working-directory: tests/browser
         env:
           TURN_HOST: 127.0.0.1
+          BROWSERS: firefox,chromium,webkit

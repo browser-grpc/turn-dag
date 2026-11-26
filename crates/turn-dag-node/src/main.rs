@@ -16,7 +16,7 @@ USAGE:
   turn-dag-node rendezvous
   turn-dag-node demo
   turn-dag-node stack
-  turn-dag-node serve-udp [--addr 127.0.0.1:3478] [--relay-ip IP] [--user USER --pass PASS]
+  turn-dag-node serve-udp [--addr 127.0.0.1:3478] [--relay-ip IP] [--user USER --pass PASS] [--rest-secret HEX --ticket ID] [--total-quota N]
   turn-dag-node keygen [--out FILE] [--backup FILE]
   turn-dag-node backup --seed-file FILE [--out FILE]
   turn-dag-node recover --backup FILE [--seed-file FILE]
@@ -49,6 +49,7 @@ fn serve_udp(args: &[String]) -> i32 {
     let mut pass: Option<String> = None;
     let mut rest_secret: Option<String> = None;
     let mut burn_tickets: Vec<String> = Vec::new();
+    let mut total_quota: Option<usize> = None;
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -58,6 +59,7 @@ fn serve_udp(args: &[String]) -> i32 {
             "--pass" => pass = it.next().cloned(),
             "--rest-secret" => rest_secret = it.next().cloned(),
             "--ticket" => burn_tickets.push(it.next().cloned().unwrap_or_default()),
+            "--total-quota" => total_quota = it.next().and_then(|v| v.parse().ok()),
             _ => {
                 eprintln!("unknown serve-udp arg: {a}");
                 return 2;
@@ -72,6 +74,9 @@ fn serve_udp(args: &[String]) -> i32 {
         .and_then(|r| r.parse().ok())
         .unwrap_or(sock_addr.ip());
     let mut server = turn_dag_turn::wire::TurnServer::new(relay);
+    if let Some(q) = total_quota {
+        server = server.with_max_allocations(q);
+    }
     if let Some(hex_secret) = rest_secret {
         let secret = turn_dag_dag::hex_decode(&hex_secret).unwrap_or_default();
         // Issuer REST credentials (username=expiry:pow:<ticket>): the
@@ -287,6 +292,12 @@ fn flow(cmd: &str) -> i32 {
     }
     let client: IpAddr = "203.0.113.10".parse().unwrap();
     let peer: IpAddr = "203.0.113.20".parse().unwrap();
+    // Real wall-clock expiry: the printed credential must be usable
+    // against a live serve-udp relay for its full 120s lifetime.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(2_000);
     match rendezvous(
         &alice.dag,
         b"demo-secret".to_vec(),
@@ -294,7 +305,7 @@ fn flow(cmd: &str) -> i32 {
         "alice",
         client,
         peer,
-        2_000,
+        now,
     ) {
         Ok(c) => {
             println!(
