@@ -213,11 +213,24 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   pair (fresh DAG-burn ticket + second registered ticket, burn-gated
   relay) also passes. WebKit launches without `--no-sandbox`
   (it rejects the flag) and SKIPs on hosts lacking its OS deps.
-  Still uncovered: >2-peer meshes and the 90s `restartIce()` path.
-- Verified: `cargo test --workspace` (94 tests), clippy, fmt,
+- Three-peer mesh (all 3 pairs relay/relay) and the 90s
+  `restartIce()` renewal (DataChannel verified alive after restart
+  at ~100s; candidates must be drained for a fixed window since
+  connectionState never drops) pass in the browser suite.
+- Live `turns:` (TLS 5349): `turn-dag-node serve-tls` runs rustls
+  over smoltcp TCP on a TUN device (`LiveTlsTurnServer`, multiple
+  connections, cross-connection ChannelData routing). Found and
+  fixed: the TUN fd must be O_NONBLOCK or smoltcp's poll loop never
+  reaches egress. Operator: create the TUN, then
+  `ip addr add 10.99.0.2/24 dev turndag0 && ip link set turndag0 up`
+  (host-side address differs from the stack's 10.99.0.1).
+  Chromium gathers a relay candidate over `turns:` in Docker
+  (`--cap-add NET_ADMIN --device /dev/net/tun`); Firefox turns:
+  SKIPs (self-signed test cert not trustable in a test profile).
+- Verified: `cargo test --workspace` (99 tests), clippy, fmt,
   `docker build --target ci`, and
-  `docker build --target browser && docker run --rm --network host turn-dag:browser`
-  (34 passed, 1 skipped — tls-turns — 0 failed).
+  `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
+  (37 passed, 1 skipped — Firefox turns cert — 0 failed).
 
 ## Open questions — ask John before guessing
 

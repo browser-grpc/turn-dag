@@ -97,21 +97,21 @@ impl Device for VirtualDevice {
     }
 }
 
-/// A running user-space stack instance.
-pub struct UserSpaceStack {
-    pub device: VirtualDevice,
+/// A running user-space stack instance, generic over the smoltcp
+/// `Device` (virtual in tests, TUN-backed for live TCP/TLS).
+pub struct UserSpaceStack<D: Device = VirtualDevice> {
+    pub device: D,
     pub iface: Interface,
     pub sockets: SocketSet<'static>,
     pub udp_handle: SocketHandle,
     pub tcp_handle: SocketHandle,
 }
 
-impl UserSpaceStack {
-    /// Create a stack with `ip/prefix`, a UDP socket on `udp_port`
-    /// and an (unconnected) user-space TCP socket. No kernel socket
-    /// of any kind is created.
-    pub fn new(ip: IpAddress, prefix_len: u8, udp_port: u16) -> Self {
-        let mut device = VirtualDevice::new(1500);
+impl<D: Device> UserSpaceStack<D> {
+    /// Create a stack over an existing device with `ip/prefix`, a UDP
+    /// socket on `udp_port` and an (unconnected) user-space TCP
+    /// socket. No kernel socket of any kind is created.
+    pub fn new_with_device(mut device: D, ip: IpAddress, prefix_len: u8, udp_port: u16) -> Self {
         let config = Config::new(HardwareAddress::Ip);
         let mut iface = Interface::new(config, &mut device, Instant::from_millis(0));
         iface.update_ip_addrs(|addrs| {
@@ -177,6 +177,61 @@ impl UserSpaceStack {
         // only TCP implementation reachable here is smoltcp's.
         let _socket: &tcp::Socket = self.sockets.get::<tcp::Socket>(self.tcp_handle);
         true
+    }
+
+    /// Create an additional user-space TCP socket in this stack and
+    /// return its handle (for listeners / accepted connections).
+    pub fn add_tcp_socket(&mut self) -> SocketHandle {
+        let socket = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0u8; 16384]),
+            tcp::SocketBuffer::new(vec![0u8; 16384]),
+        );
+        self.sockets.add(socket)
+    }
+
+    pub fn tcp_listen(&mut self, handle: SocketHandle, port: u16) -> Result<(), tcp::ListenError> {
+        self.sockets.get_mut::<tcp::Socket>(handle).listen(port)
+    }
+
+    pub fn tcp_state(&self, handle: SocketHandle) -> tcp::State {
+        self.sockets.get::<tcp::Socket>(handle).state()
+    }
+
+    pub fn tcp_remote_endpoint(&self, handle: SocketHandle) -> Option<IpEndpoint> {
+        self.sockets.get::<tcp::Socket>(handle).remote_endpoint()
+    }
+
+    /// Receive bytes from a TCP socket; Ok(0) means no data right now.
+    pub fn tcp_recv(
+        &mut self,
+        handle: SocketHandle,
+        buf: &mut [u8],
+    ) -> Result<usize, tcp::RecvError> {
+        let socket = self.sockets.get_mut::<tcp::Socket>(handle);
+        if !socket.can_recv() {
+            return Ok(0);
+        }
+        socket.recv_slice(buf)
+    }
+
+    /// Send bytes on a TCP socket; returns bytes accepted.
+    pub fn tcp_send(&mut self, handle: SocketHandle, data: &[u8]) -> Result<usize, tcp::SendError> {
+        self.sockets.get_mut::<tcp::Socket>(handle).send_slice(data)
+    }
+
+    pub fn tcp_close(&mut self, handle: SocketHandle) {
+        self.sockets.get_mut::<tcp::Socket>(handle).close();
+    }
+
+    pub fn remove_socket(&mut self, handle: SocketHandle) {
+        self.sockets.remove(handle);
+    }
+}
+
+impl UserSpaceStack<VirtualDevice> {
+    /// Create a stack on an in-memory virtual device (tests/embedding).
+    pub fn new(ip: IpAddress, prefix_len: u8, udp_port: u16) -> Self {
+        Self::new_with_device(VirtualDevice::new(1500), ip, prefix_len, udp_port)
     }
 }
 

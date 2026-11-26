@@ -36,7 +36,7 @@ Implemented in Rust (workspace of 6 crates, no longer spec-only):
 - `turn-dag-element` / `turn-dag-wallet`: indivisible elements; all PQ is real — hot ML-DSA-65 (`ml-dsa`), cold SLH-DSA-SHA2-128s (`slh-dsa`, 32B/7856B), ML-KEM-768 seed backup (`ml-kem`, blob = KEM ct || masked seed || tag).
 - `turn-dag-dag`: block-lattice DAG, representative voting (≥67%, 5s epoch ticks), bonds, fraud proofs, slashing (1 bounty / 4 burned).
 - `turn-dag-minter`: Argon2id mint PoW, epoch-bound challenges, difficulty retarget.
-- `turn-dag-turn`: TURN issuer logic (120s credentials, quotas, SSRF denied-peer list), a smoltcp user-space stack on a virtual device, and a TURN wire server (`wire`: STUN framing + Allocate/Refresh/CreatePermission/ChannelBind/Send-Data, 120s cap, denied peers 403). No kernel TCP. Live TUN/TAP device + rustls TLS (5349) remain future work.
+- `turn-dag-turn`: TURN issuer logic (120s credentials, quotas, SSRF denied-peer list), a smoltcp user-space stack on a virtual device, and a TURN wire server (`wire`: STUN framing + Allocate/Refresh/CreatePermission/ChannelBind/Send-Data, 120s cap, denied peers 403). No kernel TCP. Live servers: UDP relay (`serve-udp`) and `turns:` TLS 5349 (`serve-tls`, rustls over smoltcp TCP on a non-blocking TUN device).
 - `turn-dag-node`: CLI binary (`--help`, `init`, `status`, `mint`, `transfer`, `burn`, `rendezvous`, `demo`, `stack`) wiring all crates in-process.
 
 Verify: `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, or `docker build -t turn-dag . && docker run --rm turn-dag test`.

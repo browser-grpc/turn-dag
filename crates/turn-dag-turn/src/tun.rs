@@ -42,6 +42,12 @@ impl<F: Write> TxToken for FdTxToken<'_, F> {
     {
         let mut buf = vec![0u8; len];
         let r = f(&mut buf);
+        if std::env::var_os("TURN_DEBUG").is_some() {
+            eprintln!(
+                "tun tx {len}B proto={:#04x}",
+                buf.get(9).copied().unwrap_or(0)
+            );
+        }
         let _ = self.0.write_all(&buf);
         r
     }
@@ -60,6 +66,13 @@ impl<F: Read + Write> Device for FdDevice<F> {
         match self.inner.read(&mut self.rx_buf) {
             Ok(0) | Err(_) => None,
             Ok(n) => {
+                if std::env::var_os("TURN_DEBUG").is_some() {
+                    let hex: String = self.rx_buf[..n.min(64)]
+                        .iter()
+                        .map(|b| format!("{b:02x}"))
+                        .collect();
+                    eprintln!("tun rx {n}B {hex}");
+                }
                 let pkt = self.rx_buf[..n].to_vec();
                 Some((FdRxToken(pkt), FdTxToken(&mut self.inner)))
             }
@@ -111,6 +124,16 @@ pub fn open_tun(name: &str) -> io::Result<std::fs::File> {
     req.name[..nb.len()].copy_from_slice(nb);
     let rc = unsafe { libc::ioctl(file.as_raw_fd(), TUNSETIFF, &req as *const IfReq) };
     if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // smoltcp is a poll-based stack: its poll loop runs egress only
+    // after device.receive() returns None. A blocking TUN fd would
+    // park the loop in ingress forever and no SYN-ACK would ever be
+    // sent, so the fd MUST be non-blocking.
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
         return Err(io::Error::last_os_error());
     }
     Ok(file)

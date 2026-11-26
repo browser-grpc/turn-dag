@@ -60,7 +60,7 @@ FROM rust:${RUST_VERSION}-bookworm AS browser
 ENV DEBIAN_FRONTEND=noninteractive CARGO_TERM_COLOR=never
 ARG NODE_VERSION=22.14.0
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates git file iproute2 curl xz-utils \
+    ca-certificates git file iproute2 curl xz-utils openssl \
     && rm -rf /var/lib/apt/lists/* \
     && case "$(dpkg --print-architecture)" in arm64) NODE_ARCH=arm64 ;; amd64) NODE_ARCH=x64 ;; *) echo "unsupported arch" && exit 1 ;; esac \
     && curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \

@@ -17,6 +17,7 @@ USAGE:
   turn-dag-node demo
   turn-dag-node stack
   turn-dag-node serve-udp [--addr 127.0.0.1:3478] [--relay-ip IP] [--user USER --pass PASS] [--rest-secret HEX --ticket ID] [--total-quota N]
+  turn-dag-node serve-tls --cert CERT.pem --key KEY.pem [--tun turndag0] [--ip 10.99.0.1] [--port 5349] [--user USER --pass PASS]
   turn-dag-node keygen [--out FILE] [--backup FILE]
   turn-dag-node backup --seed-file FILE [--out FILE]
   turn-dag-node recover --backup FILE [--seed-file FILE]
@@ -29,6 +30,9 @@ fn main() {
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("demo");
     if cmd == "serve-udp" {
         std::process::exit(serve_udp(&args[2..]));
+    }
+    if cmd == "serve-tls" {
+        std::process::exit(serve_tls(&args[2..]));
     }
     if cmd == "keygen" {
         std::process::exit(keygen(&args[2..]));
@@ -111,6 +115,107 @@ fn serve_udp(args: &[String]) -> i32 {
             eprintln!("serve error: {e}");
             return 1;
         }
+    }
+}
+
+fn serve_tls(args: &[String]) -> i32 {
+    let mut tun = "turndag0".to_string();
+    let mut ip = "10.99.0.1".to_string();
+    let mut port: u16 = 5349;
+    let mut cert_path: Option<String> = None;
+    let mut key_path: Option<String> = None;
+    let mut user: Option<String> = None;
+    let mut pass: Option<String> = None;
+    let mut rest_secret: Option<String> = None;
+    let mut burn_tickets: Vec<String> = Vec::new();
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--tun" => tun = it.next().cloned().unwrap_or_default(),
+            "--ip" => ip = it.next().cloned().unwrap_or_default(),
+            "--port" => port = it.next().and_then(|v| v.parse().ok()).unwrap_or(5349),
+            "--cert" => cert_path = it.next().cloned(),
+            "--key" => key_path = it.next().cloned(),
+            "--user" => user = it.next().cloned(),
+            "--pass" => pass = it.next().cloned(),
+            "--rest-secret" => rest_secret = it.next().cloned(),
+            "--ticket" => burn_tickets.push(it.next().cloned().unwrap_or_default()),
+            _ => {
+                eprintln!("unknown serve-tls arg: {a}");
+                return 2;
+            }
+        }
+    }
+    let (Some(cert_path), Some(key_path)) = (cert_path, key_path) else {
+        eprintln!("serve-tls requires --cert CERT.pem --key KEY.pem");
+        return 2;
+    };
+    let cert_pem = match std::fs::read(&cert_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("read cert: {e}");
+            return 1;
+        }
+    };
+    let key_pem = match std::fs::read(&key_path) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("read key: {e}");
+            return 1;
+        }
+    };
+    let config = match turn_dag_turn::tls::server_config(&cert_pem, &key_pem) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("tls config: {e}");
+            return 1;
+        }
+    };
+    let Ok(relay_ip) = ip.parse::<IpAddr>() else {
+        eprintln!("bad --ip: {ip}");
+        return 2;
+    };
+    let smol_ip = match relay_ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            smoltcp::wire::IpAddress::v4(o[0], o[1], o[2], o[3])
+        }
+        IpAddr::V6(_) => {
+            eprintln!("serve-tls currently requires an IPv4 --ip");
+            return 2;
+        }
+    };
+    let mut server = turn_dag_turn::wire::TurnServer::new(relay_ip);
+    if let Some(hex_secret) = rest_secret {
+        let secret = turn_dag_dag::hex_decode(&hex_secret).unwrap_or_default();
+        server = server.with_rest_auth(secret);
+        if !burn_tickets.is_empty() {
+            server = server.with_burn_tickets(burn_tickets);
+        }
+    } else if let (Some(u), Some(p)) = (user, pass) {
+        let mut creds = std::collections::HashMap::new();
+        creds.insert(u, p);
+        server = server.with_auth("turn-dag", creds);
+    }
+    let mut live = match turn_dag_turn::live::LiveTlsTurnServer::bind_tun(
+        &tun, smol_ip, 24, config, server, port,
+    ) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!(
+                "serve-tls bind tun '{tun}' failed: {e} (needs /dev/net/tun access; \
+                 operator must also run: ip addr add {ip}/24 dev {tun} && ip link set {tun} up)"
+            );
+            return 1;
+        }
+    };
+    println!("turn-tls listening tun={tun} ip={ip} port={port}");
+    loop {
+        if let Err(e) = live.serve_once() {
+            eprintln!("serve-tls error: {e}");
+            return 1;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
 }
 

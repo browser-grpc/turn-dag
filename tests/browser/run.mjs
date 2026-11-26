@@ -354,6 +354,210 @@ async function relayOnce(page1, page2, cfg, connectTimeout, binaryBytes = 0) {
   }
 }
 
+// Three-peer full mesh: every pair gets its own relay/relay
+// DataChannel on the same TURN server.
+async function meshOnce(pages, cfg) {
+  for (const p of pages) {
+    await p.evaluate(() => { window.__mesh = { pcs: {}, cands: {}, dcs: {}, got: {} }; });
+  }
+  const initPc = async (page, label, offerer) => page.evaluate(({ label, offerer, cfg }) => {
+    const pc = new RTCPeerConnection(cfg);
+    window.__mesh.pcs[label] = pc;
+    window.__mesh.cands[label] = [];
+    window.__mesh.got[label] = [];
+    pc.onicecandidate = (e) => { if (e.candidate) window.__mesh.cands[label].push(JSON.parse(JSON.stringify(e.candidate))); };
+    if (offerer) {
+      const dc = pc.createDataChannel(`mesh-${label}`);
+      window.__mesh.dcs[label] = dc;
+      dc.onmessage = (m) => window.__mesh.got[label].push(m.data);
+    }
+    pc.ondatachannel = (e) => { window.__mesh.dcs[label] = e.channel; e.channel.onmessage = (m) => window.__mesh.got[label].push(m.data); };
+    return true;
+  }, { label, offerer, cfg });
+  const results = [];
+  for (let i = 0; i < pages.length; i++) {
+    for (let j = i + 1; j < pages.length; j++) {
+      const label = `${i}-${j}`;
+      await initPc(pages[i], label, true);
+      await initPc(pages[j], label, false);
+      const offer = await pages[i].evaluate(async (l) => {
+        const pc = window.__mesh.pcs[l];
+        await pc.setLocalDescription(await pc.createOffer());
+        return JSON.parse(JSON.stringify(pc.localDescription));
+      }, label);
+      await pages[j].evaluate(async ({ l, desc }) => { await window.__mesh.pcs[l].setRemoteDescription(desc); }, { l: label, desc: offer });
+      const answer = await pages[j].evaluate(async (l) => {
+        const pc = window.__mesh.pcs[l];
+        await pc.setLocalDescription(await pc.createAnswer());
+        return JSON.parse(JSON.stringify(pc.localDescription));
+      }, label);
+      await pages[i].evaluate(async ({ l, desc }) => { await window.__mesh.pcs[l].setRemoteDescription(desc); }, { l: label, desc: answer });
+      const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+      let connected = false;
+      while (Date.now() < deadline && !connected) {
+        for (const [from, to] of [[pages[i], pages[j]], [pages[j], pages[i]]]) {
+          const cands = await from.evaluate((l) => { const c = window.__mesh.cands[l] || []; window.__mesh.cands[l] = []; return c; }, label);
+          for (const c of cands) await to.evaluate(async ({ l, cand }) => { await window.__mesh.pcs[l].addIceCandidate(cand).catch(() => {}); }, { l: label, cand: c }).catch(() => {});
+        }
+        const s1 = await pages[i].evaluate((l) => window.__mesh.pcs[l].connectionState, label);
+        const s2 = await pages[j].evaluate((l) => window.__mesh.pcs[l].connectionState, label);
+        connected = s1 === 'connected' && s2 === 'connected';
+        if (!connected) await new Promise((r) => setTimeout(r, 250));
+      }
+      if (!connected) throw new Error(`mesh pair ${label} not connected`);
+      await pages[i].evaluate(async (l) => {
+        const dc = window.__mesh.dcs[l];
+        if (dc.readyState !== 'open') await new Promise((res, rej) => { dc.onopen = res; setTimeout(() => rej(new Error(`dc ${dc.readyState}`)), 10000); });
+        dc.send(`mesh ${l} hello`);
+      }, label);
+      let gotJ = [];
+      for (let k = 0; k < 40 && !gotJ.length; k++) {
+        gotJ = await pages[j].evaluate((l) => window.__mesh.got[l] || [], label);
+        if (!gotJ.length) await new Promise((r) => setTimeout(r, 250));
+      }
+      await pages[j].evaluate((l) => { window.__mesh.dcs[l].send(`mesh ${l} ack`); }, label);
+      let gotI = [];
+      for (let k = 0; k < 40 && !gotI.length; k++) {
+        gotI = await pages[i].evaluate((l) => window.__mesh.got[l] || [], label);
+        if (!gotI.length) await new Promise((r) => setTimeout(r, 250));
+      }
+      const pairType = await pages[i].evaluate(async (l) => {
+        const stats = await window.__mesh.pcs[l].getStats();
+        let pair = null;
+        stats.forEach((r) => {
+          if (r.type === 'candidate-pair' && (r.state === 'succeeded' || r.nominated)) {
+            const local = stats.get(r.localCandidateId);
+            const remote = stats.get(r.remoteCandidateId);
+            if (local && remote) pair = `${local.candidateType}/${remote.candidateType}`;
+          }
+        });
+        return pair;
+      }, label);
+      results.push({ label, gotJ: gotJ[0] || null, gotI: gotI[0] || null, pairType });
+    }
+  }
+  return results;
+}
+
+// Relay renewal: connect relay/relay, wait until the session is 90s
+// old (spec renewal point), restartIce() + renegotiate, and prove the
+// DataChannel still delivers afterwards.
+async function restartIceOnce(page1, page2, cfg) {
+  const init = async (page, offerer) => page.evaluate(async ({ cfg, offerer }) => {
+    const pc = new RTCPeerConnection(cfg);
+    window.__pc = pc;
+    window.__cands = [];
+    pc.onicecandidate = (e) => { if (e.candidate) window.__cands.push(JSON.parse(JSON.stringify(e.candidate))); };
+    window.__dc = offerer ? pc.createDataChannel('rendezvous') : null;
+    window.__got = [];
+    pc.ondatachannel = (e) => { window.__dc = e.channel; e.channel.onmessage = (m) => window.__got.push(m.data); };
+    if (window.__dc) window.__dc.onmessage = (m) => window.__got.push(m.data);
+    return true;
+  }, { cfg, offerer });
+  const drain = async (from, to) => {
+    const cands = await from.evaluate(() => { const c = window.__cands || []; window.__cands = []; return c; });
+    for (const c of cands) await to.evaluate(async (cand) => { await window.__pc.addIceCandidate(cand).catch(() => {}); }, c).catch(() => {});
+  };
+  const negotiate = async (offererPage, answererPage) => {
+    const offer = await offererPage.evaluate(async () => {
+      const pc = window.__pc;
+      await pc.setLocalDescription(await pc.createOffer());
+      return JSON.parse(JSON.stringify(pc.localDescription));
+    });
+    await answererPage.evaluate(async (desc) => { await window.__pc.setRemoteDescription(desc); }, offer);
+    const answer = await answererPage.evaluate(async () => {
+      const pc = window.__pc;
+      await pc.setLocalDescription(await pc.createAnswer());
+      return JSON.parse(JSON.stringify(pc.localDescription));
+    });
+    await offererPage.evaluate(async (desc) => { await window.__pc.setRemoteDescription(desc); }, answer);
+  };
+  const waitConnected = async (timeout) => {
+    const deadline = Date.now() + timeout;
+    while (Date.now() < deadline) {
+      await drain(page1, page2);
+      await drain(page2, page1);
+      const s1 = await page1.evaluate(() => window.__pc.connectionState);
+      const s2 = await page2.evaluate(() => window.__pc.connectionState);
+      if (s1 === 'connected' && s2 === 'connected') return Date.now();
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    throw new Error('not connected');
+  };
+  const sendAndExpect = async (from, to, text) => {
+    await from.evaluate((t) => { window.__dc.send(t); }, text);
+    for (let i = 0; i < 40; i++) {
+      const got = await to.evaluate(() => window.__got || []);
+      if (got.includes(text)) return true;
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    return false;
+  };
+  try {
+    await init(page1, true);
+    await init(page2, false);
+    await negotiate(page1, page2);
+    const connectedAt = await waitConnected(CONNECT_TIMEOUT_MS);
+    await page1.evaluate(async () => {
+      const dc = window.__dc;
+      if (dc.readyState !== 'open') await new Promise((res, rej) => { dc.onopen = res; setTimeout(() => rej(new Error(dc.readyState)), 10000); });
+    });
+    if (!(await sendAndExpect(page1, page2, 'before renewal'))) throw new Error('pre-renewal message lost');
+    // Wait until the relay session is 90s old, then restart ICE.
+    const waitMs = Math.max(0, 92000 - (Date.now() - connectedAt));
+    console.log(`[restartIce] waiting ${Math.round(waitMs / 1000)}s to the 90s renewal point`);
+    await new Promise((r) => setTimeout(r, waitMs));
+    await page1.evaluate(() => { window.__pc.restartIce(); });
+    await negotiate(page1, page2);
+    // connectionState often never leaves 'connected' during a restart,
+    // so keep shuttling the *new* ICE candidates for a fixed window
+    // instead of stopping at the first 'connected' reading.
+    const drainUntil = Date.now() + 8000;
+    while (Date.now() < drainUntil) {
+      await drain(page1, page2);
+      await drain(page2, page1);
+      await new Promise((r) => setTimeout(r, 250));
+    }
+    await waitConnected(CONNECT_TIMEOUT_MS);
+    if (!(await sendAndExpect(page1, page2, 'after renewal'))) throw new Error('post-renewal message lost');
+    if (!(await sendAndExpect(page2, page1, 'renewal ack'))) throw new Error('post-renewal ack lost');
+    // The restarted pair may take a moment to show as nominated.
+    let pairType = null;
+    for (let i = 0; i < 20 && !pairType; i++) {
+      pairType = await page1.evaluate(async () => {
+        const stats = await window.__pc.getStats();
+        let pair = null;
+        stats.forEach((r) => {
+          if (r.type === 'candidate-pair' && (r.state === 'succeeded' || r.nominated)) {
+            const local = stats.get(r.localCandidateId);
+            const remote = stats.get(r.remoteCandidateId);
+            if (local && remote) pair = `${local.candidateType}/${remote.candidateType}`;
+          }
+        });
+        return pair;
+      });
+      if (!pairType) await new Promise((r) => setTimeout(r, 250));
+    }
+    const pairDebug = await page1.evaluate(async () => {
+      const stats = await window.__pc.getStats();
+      const out = [];
+      stats.forEach((r) => {
+        if (r.type === 'candidate-pair') {
+          const local = stats.get(r.localCandidateId);
+          const remote = stats.get(r.remoteCandidateId);
+          out.push(`${r.state}/${r.nominated}/${local?.candidateType}/${remote?.candidateType}`);
+        }
+        if (r.type === 'local-candidate' || r.type === 'remote-candidate') out.push(`${r.type}:${r.candidateType}`);
+      });
+      return out;
+    });
+    return { pairType, pairDebug, ageSecs: Math.round((Date.now() - connectedAt) / 1000) };
+  } finally {
+    await page1.evaluate(() => { try { window.__pc?.close(); } catch {} }).catch(() => {});
+    await page2.evaluate(() => { try { window.__pc?.close(); } catch {} }).catch(() => {});
+  }
+}
+
 // ---------- main ----------
 try {
   await waitListening(startServer(['serve-udp', '--addr', `0.0.0.0:${PORT}`, '--relay-ip', HOST, '--user', USER, '--pass', PASS]), 'static TURN server');
@@ -393,10 +597,8 @@ try {
       `cls=${alloc.cls} lifetime=${alloc.lifetime} relayed=${alloc.relayed}`);
     const tcp = await c.authed(M.ALLOCATE, [[A.REQUESTED_TRANSPORT, Buffer.from([6, 0, 0, 0])]], USER, PASS, realmNonce, PORT);
     record('wire-tcp-refused', tcp.errorCode === 442 ? 'PASS' : 'FAIL', `error=${tcp.errorCode}`);
-    // TLS: no live 5349 listener exists (tls.rs is rustls over the
-    // smoltcp stack only), so a browser turns: allocation is not
-    // supportable yet - record SKIP, never a fake PASS.
-    record('tls-turns', 'SKIP', 'no live TLS 5349 listener (rustls-over-smoltcp only); TCP refusal covered by wire-tcp-refused');
+    // TLS listener existence is exercised in the turns: section at
+    // the end (needs the TUN-backed serve-tls + trusted-ish cert).
     let deniedOk = true;
     let deniedDetail = '';
     // Denied-peer with txn-correct XOR encoding (server un-XORs with the
@@ -636,6 +838,86 @@ try {
   }
   if (ENGINES.includes('webkit') && ENGINES.includes('chromium')) {
     await crossRelay('cross:chromium-webkit', 'chromium', chromium, 'webkit', webkit, turnCfg(USER, PASS), 0, true);
+  }
+
+  // Three-peer mesh (Chromium contexts) + 90s restartIce (Firefox).
+  if (ENGINES.includes('chromium')) {
+    let meshBrowser;
+    try {
+      meshBrowser = await chromium.launch({ args: ['--no-sandbox'] });
+      const pages = [];
+      for (let i = 0; i < 3; i++) {
+        const ctx = await meshBrowser.newContext();
+        const pg = await ctx.newPage();
+        await pg.goto(pageUrl);
+        pages.push(pg);
+      }
+      const mesh = await meshOnce(pages, turnCfg(USER, PASS));
+      const ok = mesh.length === 3 && mesh.every((m) => m.gotJ === `mesh ${m.label} hello` && m.gotI === `mesh ${m.label} ack` && m.pairType === 'relay/relay');
+      recordNet('mesh:three-peer', ok, '3 peers, all 3 pairs relay/relay both ways', JSON.stringify(mesh).slice(0, 300));
+    } catch (e) {
+      recordNet('mesh:three-peer', false, '', String(e).slice(0, 300));
+    } finally {
+      try { await meshBrowser?.close(); } catch {}
+    }
+  }
+  if (ENGINES.includes('firefox')) {
+    let rBrowser;
+    try {
+      rBrowser = await firefox.launch({ args: ['--no-sandbox'] });
+      const c1 = await rBrowser.newContext();
+      const c2 = await rBrowser.newContext();
+      const p1 = await c1.newPage();
+      const p2 = await c2.newPage();
+      await p1.goto(pageUrl);
+      await p2.goto(pageUrl);
+      const r = await restartIceOnce(p1, p2, turnCfg(USER, PASS));
+      recordNet('relay:restart-ice-90s', r.pairType === 'relay/relay', `DataChannel alive after restartIce at ${r.ageSecs}s, pair=${r.pairType}`, JSON.stringify(r).slice(0, 300));
+    } catch (e) {
+      recordNet('relay:restart-ice-90s', false, '', String(e).slice(0, 300));
+    } finally {
+      try { await rBrowser?.close(); } catch {}
+    }
+  }
+
+  // ---------- turns: (TLS 5349) ----------
+  // Requires the TUN-backed serve-tls (scripts/browser-test.sh sets
+  // TURNS_URL when /dev/net/tun + NET_ADMIN are available). Chromium
+  // runs with --ignore-certificate-errors for the self-signed test
+  // cert; Firefox cannot trust it in a test profile, so its turns:
+  // attempt is a SKIP, never a fake PASS.
+  const turnsUrl = process.env.TURNS_URL;
+  if (turnsUrl && ENGINES.includes('chromium')) {
+    let tBrowser;
+    try {
+      tBrowser = await chromium.launch({ args: ['--no-sandbox', '--ignore-certificate-errors'] });
+      const ctx = await tBrowser.newContext({ ignoreHTTPSErrors: true });
+      const page = await ctx.newPage();
+      await page.goto(pageUrl);
+      const g = await page.evaluate(async (urls) => {
+        const pc = new RTCPeerConnection({ iceServers: [{ urls, username: 'browser-test-user', credential: 'browser-test-secret' }], iceTransportPolicy: 'relay' });
+        const cands = []; const errs = [];
+        pc.onicecandidate = (e) => { if (e.candidate?.candidate) cands.push(e.candidate.candidate); };
+        pc.onicecandidateerror = (e) => errs.push(`${e.errorCode} ${e.errorText || ''}`);
+        const done = new Promise((res) => { pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') res(); }; setTimeout(res, 15000); });
+        pc.createDataChannel('probe');
+        await pc.setLocalDescription(await pc.createOffer());
+        await done;
+        const s = { state: pc.iceGatheringState, cands, errs };
+        pc.close(); return s;
+      }, turnsUrl).catch((e) => ({ state: 'error', cands: [], errs: [String(e)] }));
+      const relay = g.cands.filter((c) => c.includes('typ relay'));
+      record('tls:chromium-turns', relay.length > 0 ? 'PASS' : (REQUIRE ? 'FAIL' : 'SKIP'),
+        relay.length > 0 ? `relay candidate over ${turnsUrl}` : `no relay over ${turnsUrl}: state=${g.state} errs=${g.errs.join(';')}`);
+      await ctx.close();
+    } catch (e) {
+      record('tls:chromium-turns', REQUIRE ? 'FAIL' : 'SKIP', String(e).slice(0, 250));
+    } finally {
+      try { await tBrowser?.close(); } catch {}
+    }
+    record('tls:firefox-turns', 'SKIP', 'self-signed test cert is not trustable for TURN TLS in a Firefox test profile');
+  } else {
+    record('tls:turns', 'SKIP', 'no TURNS_URL (needs TUN-backed serve-tls: /dev/net/tun + NET_ADMIN); TCP refusal covered by wire-tcp-refused');
   }
 
   const failed = results.filter((r) => r.status === 'FAIL');
