@@ -1,26 +1,17 @@
-# Runs the Playwright WebRTC suite against the live Rust TURN server.
-# GitHub-hosted runners use loopback TURN (policy-blocked in headless
-# browsers), so network sub-tests SKIP there; the hard gate is the
-# Docker --network host job (scripts/browser-test.sh, REQUIRE_RELAY=1,
-# MIN_PASS>=10). Raw-wire and negative sub-tests still FAIL here.
+# Runs the Playwright WebRTC suite in its Docker gate form: host
+# networking (real LAN path to the relay) + TUN/NET_ADMIN (turns:
+# tests). REQUIRE_RELAY=1 makes gather/relay/mesh/TLS failures hard
+# failures with a minimum PASS count. The old loopback npm job is
+# gone - it skipped almost everything by design.
 name: browser-test
 on: [push, pull_request]
 jobs:
   browser:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 22
-      - run: cargo build -p turn-dag-node
-      - run: npm ci
-        working-directory: tests/browser
-      - run: npx playwright install firefox chromium webkit --with-deps
-        working-directory: tests/browser
-      - run: node run.mjs
-        working-directory: tests/browser
-        env:
-          TURN_HOST: 127.0.0.1
-          BROWSERS: firefox,chromium,webkit
+      - run: docker build --target browser -t turn-dag:browser .
+      - run: >-
+          docker run --rm --network host --cap-add NET_ADMIN
+          --device /dev/net/tun turn-dag:browser

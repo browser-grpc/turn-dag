@@ -232,10 +232,33 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   ChannelData stream framing in `take_frame`). Firefox turns:
   SKIPs with evidence — packet capture shows this Firefox build
   attempts `turn:?transport=tcp` but never initiates `turns:`.
-- Verified: `cargo test --workspace` (100 tests), clippy, fmt,
+- Verified: `cargo test --workspace` (105 tests), clippy, fmt,
   `docker build --target ci`, and
   `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
-  (38 passed, 1 skipped — Firefox turns — 0 failed).
+  (41 passed, 1 skipped — Firefox turns — 0 failed).
+
+## Virtual network, rate limiting, scale, CI gate (2026-11-25)
+
+- **Virtual network (Rust): yes, implemented.** `turn-dag-turn::vnet`
+  is a shared switch connecting any number of smoltcp stacks by IPv4
+  address, with deterministic latency (`with_latency_ticks`) and loss
+  (`with_drop_every`) knobs. It answers "multi-node tests without
+  TUN/root/Docker": real IP packets between stacks under `cargo test`
+  in milliseconds. The FdDevice/TUN path remains for live traffic only.
+- **max-bps is now enforced in the wire server**: per-allocation
+  token bucket (16384 B/s, 1s burst; `with_max_bps`, 0 disables).
+  The ~1.9MB total byte cap is proven in Rust with a synthetic clock;
+  the browser suite asserts the live burst rate (`wire-bps-rate`).
+- **Browser longevity + scale**: a Firefox session must stay alive
+  past the 120s allocation lifetime via client Refresh
+  (`relay:allocation-longevity-120s`), and the suite adds 50
+  concurrent raw allocations plus 5 simultaneous Chromium relay pairs.
+- **CI gates it**: the GitHub browser workflow now only builds and
+  runs the Docker host-network/TUN suite; the loopback job that
+  skipped everything is gone. Playwright engine coverage is
+  Blink (Chromium), Gecko (Firefox), and WebKit — every shipping
+  engine family; Edge is Blink, and Playwright WebKit approximates
+  (does not equal) real Safari, which no CI here can run.
 
 ## Decisions (settled 2026-11-25, "go all, pick as needed")
 

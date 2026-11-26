@@ -326,6 +326,9 @@ struct Allocation {
     /// allocation, when REST/burn auth is in use. One live allocation
     /// per ticket (issuer user-quota=1 at the wire).
     ticket: Option<String>,
+    /// Token bucket for `max-bps` (1 second burst capacity).
+    tokens: u64,
+    last_refill: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -379,6 +382,8 @@ pub struct TurnServer {
     nonce: String,
     /// `total-quota`: max concurrent allocations (spec: 200).
     max_allocations: usize,
+    /// `max-bps` per allocation in bytes/sec (spec: 16384; 0 = off).
+    max_bps: u64,
 }
 impl TurnServer {
     pub fn new(server_ip: IpAddr) -> Self {
@@ -394,11 +399,18 @@ impl TurnServer {
             burn_tickets: None,
             nonce: String::new(),
             max_allocations: 200,
+            max_bps: 16_384,
         }
     }
     /// Override `total-quota` (default 200, spec coturn tuning).
     pub fn with_max_allocations(mut self, max: usize) -> Self {
         self.max_allocations = max;
+        self
+    }
+    /// Override per-allocation `max-bps` (default 16384; 0 disables
+    /// rate limiting, byte cap still applies).
+    pub fn with_max_bps(mut self, bps: u64) -> Self {
+        self.max_bps = bps;
         self
     }
     /// Verify issuer-issued REST credentials (username=expiry:pow:<ticket>,
@@ -565,7 +577,7 @@ impl TurnServer {
             (method::REFRESH, Class::Request) => self.on_refresh(msg, src, now),
             (method::CREATE_PERMISSION, Class::Request) => self.on_permission(msg, src),
             (method::CHANNEL_BIND, Class::Request) => self.on_channel_bind(msg, src),
-            (method::SEND, Class::Indication) => self.on_send(msg, src),
+            (method::SEND, Class::Indication) => self.on_send(msg, src, now),
             (method::BINDING, Class::Request) => {
                 let mut r = StunMessage::new(method::BINDING, Class::Success, msg.transaction);
                 r.push_attr(
@@ -641,6 +653,8 @@ impl TurnServer {
                 channels: HashMap::new(),
                 bytes: 0,
                 ticket,
+                tokens: self.max_bps,
+                last_refill: now,
             },
         );
         let mut r = StunMessage::new(method::ALLOCATE, Class::Success, msg.transaction);
@@ -733,12 +747,12 @@ impl TurnServer {
             None => self.respond(err_response(msg, 437, "Allocation Mismatch"), msg),
         }
     }
-    fn on_send(&mut self, msg: &StunMessage, src: SocketAddr) -> HandleOutcome {
+    fn on_send(&mut self, msg: &StunMessage, src: SocketAddr, now: u64) -> HandleOutcome {
         let (Some(peer), Some(payload)) = (self.peer_of(msg), msg.attr(attr_type::DATA)) else {
             return HandleOutcome::Drop;
         };
         let payload = payload.to_vec();
-        self.deliver(src, peer, &payload, msg.transaction)
+        self.deliver(src, peer, &payload, msg.transaction, now)
     }
     /// Relay one payload from `src` toward `peer`. If `peer` is another
     /// allocation's relayed address, deliver to that client (ChannelData
@@ -750,10 +764,23 @@ impl TurnServer {
         peer: SocketAddr,
         payload: &[u8],
         txn: [u8; 12],
+        now: u64,
     ) -> HandleOutcome {
         let Some(sender) = self.allocations.get(&src).cloned() else {
             return HandleOutcome::Drop;
         };
+        // max-bps token bucket (1s burst): refill, then charge.
+        if self.max_bps > 0 {
+            let elapsed = now.saturating_sub(sender.last_refill);
+            let tokens = (sender.tokens + elapsed * self.max_bps).min(self.max_bps);
+            if (payload.len() as u64) > tokens {
+                return HandleOutcome::Drop;
+            }
+            if let Some(a) = self.allocations.get_mut(&src) {
+                a.tokens = tokens - payload.len() as u64;
+                a.last_refill = now;
+            }
+        }
         if !sender.permissions.contains(&peer.ip()) && !self.is_internal_relayed(peer) {
             return HandleOutcome::Drop;
         }
@@ -840,7 +867,7 @@ impl TurnServer {
         else {
             return HandleOutcome::Drop;
         };
-        self.deliver(src, peer, &payload, [0u8; 12])
+        self.deliver(src, peer, &payload, [0u8; 12], now)
     }
 }
 
@@ -1311,6 +1338,72 @@ mod tests {
         }
         // Truncated channel data is dropped, never panics.
         assert_eq!(s.handle(&[0x40, 0x01, 0xFF], a, 4), HandleOutcome::Drop);
+    }
+
+    fn setup_pair(s: &mut TurnServer) -> (SocketAddr, SocketAddr) {
+        let a: SocketAddr = "127.0.0.1:40001".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:40002".parse().unwrap();
+        decode_ok(s.handle(&allocate_req(), a, 0));
+        decode_ok(s.handle(&allocate_req(), b, 0));
+        let ra = s.relayed_address(&a).unwrap();
+        let rb = s.relayed_address(&b).unwrap();
+        for (src, peer) in [(a, rb), (b, ra)] {
+            let mut m = StunMessage::new(method::CREATE_PERMISSION, Class::Request, txn());
+            m.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(peer, &txn()));
+            decode_ok(s.handle(&m.encode(), src, 0));
+        }
+        for (src, peer) in [(a, rb), (b, ra)] {
+            let mut cb = StunMessage::new(method::CHANNEL_BIND, Class::Request, txn());
+            cb.push_attr(attr_type::CHANNEL_NUMBER, 0x4001u16.to_be_bytes().to_vec());
+            cb.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(peer, &txn()));
+            decode_ok(s.handle(&cb.encode(), src, 0));
+        }
+        (a, b)
+    }
+
+    #[test]
+    fn bps_rate_limit_burst_drops_then_refills() {
+        let mut s = server().with_max_bps(1000);
+        let (a, _b) = setup_pair(&mut s);
+        let payload = vec![7u8; 600];
+        assert!(matches!(
+            s.handle(&encode_channel_data(0x4001, &payload), a, 10),
+            HandleOutcome::Forward { .. }
+        ));
+        // Only 400 tokens left in this second: next 600B is dropped.
+        assert_eq!(
+            s.handle(&encode_channel_data(0x4001, &payload), a, 10),
+            HandleOutcome::Drop
+        );
+        // After 1s the bucket refills (1000/s) and delivery resumes.
+        assert!(matches!(
+            s.handle(&encode_channel_data(0x4001, &payload), a, 11),
+            HandleOutcome::Forward { .. }
+        ));
+    }
+
+    #[test]
+    fn byte_cap_still_enforced_with_rate_limit_off() {
+        let mut s = server().with_max_bps(0);
+        let (a, _b) = setup_pair(&mut s);
+        let payload = vec![9u8; 2000];
+        let mut forwarded: u64 = 0;
+        for _ in 0..1100 {
+            match s.handle(&encode_channel_data(0x4001, &payload), a, 10) {
+                HandleOutcome::Forward { data, .. } => {
+                    forwarded += (data.len() - 4) as u64;
+                }
+                HandleOutcome::Drop => break,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        // Forwarded payload counts once per frame on the wire; the
+        // server charges both allocations, capping at ~1.9MB.
+        assert!(
+            forwarded >= s.byte_cap - 80 && forwarded <= s.byte_cap,
+            "forwarded={forwarded} cap={}",
+            s.byte_cap
+        );
     }
 }
 

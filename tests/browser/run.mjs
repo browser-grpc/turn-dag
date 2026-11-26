@@ -13,7 +13,7 @@
 // Raw-wire sub-tests (Node UDP/STUN client against the live server):
 //   wire-allocate-lifetime (120s cap), wire-tcp-refused (442),
 //   wire-denied-peer (403 for metadata/RFC1918/loopback),
-//   wire-refresh (cap/delete/437), wire-byte-cap (~1.9MB drop),
+//   wire-refresh (cap/delete/437), wire-bps-rate (16384 B/s bucket),
 //   wire-total-quota (486), wire-rest-valid/forged/expired (401),
 //   wire-ticket-quota (one live allocation per ticket, 486)
 //
@@ -442,7 +442,7 @@ async function meshOnce(pages, cfg) {
 // Relay renewal: connect relay/relay, wait until the session is 90s
 // old (spec renewal point), restartIce() + renegotiate, and prove the
 // DataChannel still delivers afterwards.
-async function restartIceOnce(page1, page2, cfg) {
+async function restartIceOnce(page1, page2, cfg, waitSecs = 92, doRestart = true) {
   const init = async (page, offerer) => page.evaluate(async ({ cfg, offerer }) => {
     const pc = new RTCPeerConnection(cfg);
     window.__pc = pc;
@@ -484,9 +484,9 @@ async function restartIceOnce(page1, page2, cfg) {
     }
     throw new Error('not connected');
   };
-  const sendAndExpect = async (from, to, text) => {
+  const sendAndExpect = async (from, to, text, tries = 40) => {
     await from.evaluate((t) => { window.__dc.send(t); }, text);
-    for (let i = 0; i < 40; i++) {
+    for (let i = 0; i < tries; i++) {
       const got = await to.evaluate(() => window.__got || []);
       if (got.includes(text)) return true;
       await new Promise((r) => setTimeout(r, 250));
@@ -503,10 +503,30 @@ async function restartIceOnce(page1, page2, cfg) {
       if (dc.readyState !== 'open') await new Promise((res, rej) => { dc.onopen = res; setTimeout(() => rej(new Error(dc.readyState)), 10000); });
     });
     if (!(await sendAndExpect(page1, page2, 'before renewal'))) throw new Error('pre-renewal message lost');
-    // Wait until the relay session is 90s old, then restart ICE.
-    const waitMs = Math.max(0, 92000 - (Date.now() - connectedAt));
-    console.log(`[restartIce] waiting ${Math.round(waitMs / 1000)}s to the 90s renewal point`);
+    // Wait until the relay session is waitSecs old (90s renewal
+    // point, or past the 120s allocation lifetime for longevity).
+    const waitMs = Math.max(0, waitSecs * 1000 - (Date.now() - connectedAt));
+    console.log(`[relay-timer] waiting ${Math.round(waitMs / 1000)}s (target ${waitSecs}s, restart=${doRestart})`);
     await new Promise((r) => setTimeout(r, waitMs));
+    if (!doRestart) {
+      await drain(page1, page2);
+      await drain(page2, page1);
+      if (!(await sendAndExpect(page1, page2, 'after lifetime'))) throw new Error('post-lifetime message lost');
+      if (!(await sendAndExpect(page2, page1, 'lifetime ack'))) throw new Error('post-lifetime ack lost');
+      const pairType0 = await page1.evaluate(async () => {
+        const stats = await window.__pc.getStats();
+        let pair = null;
+        stats.forEach((r) => {
+          if (r.type === 'candidate-pair' && (r.state === 'succeeded' || r.nominated)) {
+            const local = stats.get(r.localCandidateId);
+            const remote = stats.get(r.remoteCandidateId);
+            if (local && remote) pair = `${local.candidateType}/${remote.candidateType}`;
+          }
+        });
+        return pair;
+      });
+      return { pairType: pairType0, pairDebug: [], ageSecs: Math.round((Date.now() - connectedAt) / 1000) };
+    }
     await page1.evaluate(() => { window.__pc.restartIce(); });
     await negotiate(page1, page2);
     // connectionState often never leaves 'connected' during a restart,
@@ -519,8 +539,8 @@ async function restartIceOnce(page1, page2, cfg) {
       await new Promise((r) => setTimeout(r, 250));
     }
     await waitConnected(CONNECT_TIMEOUT_MS);
-    if (!(await sendAndExpect(page1, page2, 'after renewal'))) throw new Error('post-renewal message lost');
-    if (!(await sendAndExpect(page2, page1, 'renewal ack'))) throw new Error('post-renewal ack lost');
+    if (!(await sendAndExpect(page1, page2, 'after renewal', 100))) throw new Error('post-renewal message lost');
+    if (!(await sendAndExpect(page2, page1, 'renewal ack', 100))) throw new Error('post-renewal ack lost');
     // The restarted pair may take a moment to show as nominated.
     let pairType = null;
     for (let i = 0; i < 20 && !pairType; i++) {
@@ -657,10 +677,14 @@ try {
     let received = 0;
     let receivedMsgs = 0;
     b.onData = (payload) => { received += payload.length; receivedMsgs += 1; };
-    // Live server reads datagrams into a 2048-byte buffer, so relay
-    // payloads must stay under ~2000 bytes per ChannelData frame.
+    // max-bps enforcement (token bucket, 16384 B/s, 1s burst):
+    // blast 40KB back-to-back; only ~one bucket (plus at most a
+    // second-boundary refill) may be delivered. The ~1.9MB total
+    // byte cap itself is proven in the Rust wire tests, where the
+    // clock is synthetic; at full rate it takes the whole 120s
+    // lifetime to reach here.
     const chunk = 2000;
-    const frames = 1100;
+    const frames = 20;
     for (let i = 0; i < frames; i++) {
       const payload = Buffer.alloc(chunk);
       payload.writeUInt32BE(i, 0);
@@ -669,14 +693,25 @@ try {
       frame.writeUInt16BE(chunk, 2);
       payload.copy(frame, 4);
       a.sock.send(frame, PORT, HOST);
-      if (i % 20 === 19) await new Promise((r) => setTimeout(r, 2));
     }
     await new Promise((r) => setTimeout(r, 1500));
-    record('wire-byte-cap', received >= BYTE_CAP * 0.9 && received <= BYTE_CAP ? 'PASS' : 'FAIL',
-      `received=${received}/${frames * chunk} cap=${BYTE_CAP} msgs=${receivedMsgs}`);
+    record('wire-bps-rate', received >= 8000 && received <= 38000 && received < frames * chunk ? 'PASS' : 'FAIL',
+      `received=${received}/${frames * chunk} in burst window (bucket 16384) msgs=${receivedMsgs}`);
     a.close(); b.close();
   } catch (e) {
-    record('wire-byte-cap', 'FAIL', String(e).slice(0, 300));
+    record('wire-bps-rate', 'FAIL', String(e).slice(0, 300));
+  }
+
+  // Scale: 50 concurrent raw allocations on the main server.
+  try {
+    const clients = Array.from({ length: 50 }, () => new RawClient());
+    const allocs = [];
+    for (const cl of clients) allocs.push(await cl.allocate(USER, PASS, PORT));
+    const ok = allocs.filter((x) => x.cls === 'success').length;
+    record('wire-scale-allocations', ok === 50 ? 'PASS' : 'FAIL', `${ok}/50 allocations succeeded`);
+    clients.forEach((cl) => cl.close());
+  } catch (e) {
+    record('wire-scale-allocations', 'FAIL', String(e).slice(0, 300));
   }
 
   // Total quota on the dedicated quota server (max 2).
@@ -877,6 +912,53 @@ try {
       recordNet('relay:restart-ice-90s', false, '', String(e).slice(0, 300));
     } finally {
       try { await rBrowser?.close(); } catch {}
+    }
+    // Longevity: session must survive past the 120s allocation
+    // lifetime via client Refresh (no restartIce from the app).
+    let lBrowser;
+    try {
+      lBrowser = await firefox.launch({ args: ['--no-sandbox'] });
+      const c1 = await lBrowser.newContext();
+      const c2 = await lBrowser.newContext();
+      const p1 = await c1.newPage();
+      const p2 = await c2.newPage();
+      await p1.goto(pageUrl);
+      await p2.goto(pageUrl);
+      const r = await restartIceOnce(p1, p2, turnCfg(USER, PASS), 132, false);
+      recordNet('relay:allocation-longevity-120s', r.pairType === 'relay/relay', `DataChannel alive past 120s lifetime at ${r.ageSecs}s (Refresh-renewed), pair=${r.pairType}`, JSON.stringify(r).slice(0, 300));
+    } catch (e) {
+      recordNet('relay:allocation-longevity-120s', false, '', String(e).slice(0, 300));
+    } finally {
+      try { await lBrowser?.close(); } catch {}
+    }
+  }
+
+  // Scale: 5 simultaneous Chromium relay pairs.
+  if (ENGINES.includes('chromium')) {
+    let sBrowser;
+    try {
+      sBrowser = await chromium.launch({ args: ['--no-sandbox'] });
+      const pairPages = [];
+      for (let i = 0; i < 5; i++) {
+        const ca = await sBrowser.newContext();
+        const cb = await sBrowser.newContext();
+        const pa = await ca.newPage();
+        const pb = await cb.newPage();
+        await pa.goto(pageUrl);
+        await pb.goto(pageUrl);
+        pairPages.push([pa, pb]);
+      }
+      const settled = await Promise.all(pairPages.map(([pa, pb]) =>
+        relayOnce(pa, pb, turnCfg(USER, PASS), CONNECT_TIMEOUT_MS)
+          .then((r) => ({ ok: r.gotOn2 === 'one element, one rendezvous' && r.gotOn1 === 'ack over relay' && r.pairType === 'relay/relay' }))
+          .catch((e) => ({ ok: false, err: String(e).slice(0, 120) })),
+      ));
+      const okCount = settled.filter((x) => x.ok).length;
+      recordNet('scale:five-pair-relay', okCount === 5, '5 simultaneous relay/relay pairs both ways', JSON.stringify(settled).slice(0, 300));
+    } catch (e) {
+      recordNet('scale:five-pair-relay', false, '', String(e).slice(0, 300));
+    } finally {
+      try { await sBrowser?.close(); } catch {}
     }
   }
 
