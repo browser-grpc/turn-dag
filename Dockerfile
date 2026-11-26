@@ -54,6 +54,9 @@ CMD ["run"]
 # ---------- ci = build + test, nothing else ----------
 FROM test AS ci
 RUN echo "== ci == build+test: PASS"
+# `docker run turn-dag:ci ci` must dispatch through entrypoint.sh
+# (the test stage otherwise has no entrypoint and run fails 127).
+ENTRYPOINT ["./scripts/entrypoint.sh"]
 
 # ---------- browser (Playwright WebRTC relay tests, in-container) ----------
 FROM rust:${RUST_VERSION}-bookworm AS browser
