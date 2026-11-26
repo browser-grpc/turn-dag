@@ -339,7 +339,6 @@ fn cli_help_and_demo_flows() {
         &["--help"][..],
         &["demo"][..],
         &["relaypass"][..],
-        &["rendezvous"][..], // deprecated alias still works
         &["stack"][..],
         &["init"][..],
         &["status"][..],

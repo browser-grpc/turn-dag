@@ -183,22 +183,6 @@ pub fn issue_relay_pass(
     Ok(creds.into_iter().next().expect("one credential"))
 }
 
-/// Deprecated alias for [`issue_relay_pass`] (the concept was renamed
-/// from "rendezvous" to "relay pass" to avoid confusion with
-/// grpc-dc's rendezvous endpoint).
-#[deprecated(note = "renamed to issue_relay_pass")]
-pub fn rendezvous(
-    dag: &Dag,
-    secret: Vec<u8>,
-    burn_hash: [u8; 32],
-    user: &str,
-    client_ip: std::net::IpAddr,
-    peer_ip: std::net::IpAddr,
-    now: u64,
-) -> Result<turn_dag_turn::TurnCredential, turn_dag_turn::RedeemError> {
-    issue_relay_pass(dag, secret, burn_hash, user, client_ip, peer_ip, now)
-}
-
 /// Mint one element via real Argon2id (cheap params) + confirmed Mint block.
 pub fn mint_one(
     dag: &mut Dag,

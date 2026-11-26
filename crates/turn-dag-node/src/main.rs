@@ -13,7 +13,7 @@ USAGE:
   turn-dag-node mint
   turn-dag-node transfer
   turn-dag-node burn
-  turn-dag-node relaypass   (burn -> 120s TURN credential; formerly 'rendezvous')
+  turn-dag-node relaypass   (burn -> 120s TURN credential)
   turn-dag-node demo
   turn-dag-node stack
   turn-dag-node serve-udp [--addr 127.0.0.1:3478] [--relay-ip IP] [--user USER --pass PASS] [--rest-secret HEX --ticket ID] [--total-quota N]
@@ -263,7 +263,7 @@ fn run(cmd: &str) -> i32 {
             );
             0
         }
-        "mint" | "transfer" | "burn" | "rendezvous" | "relaypass" | "demo" => flow(cmd),
+        "mint" | "transfer" | "burn" | "relaypass" | "demo" => flow(cmd),
         _ => {
             eprintln!("unknown command: {cmd}\n{HELP}");
             2
