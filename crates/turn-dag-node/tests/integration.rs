@@ -338,7 +338,8 @@ fn cli_help_and_demo_flows() {
     for args in [
         &["--help"][..],
         &["demo"][..],
-        &["rendezvous"][..],
+        &["relaypass"][..],
+        &["rendezvous"][..], // deprecated alias still works
         &["stack"][..],
         &["init"][..],
         &["status"][..],
@@ -354,7 +355,7 @@ fn cli_help_and_demo_flows() {
         .arg("--help")
         .output()
         .unwrap();
-    assert!(String::from_utf8_lossy(&help.stdout).contains("burn-for-rendezvous"));
+    assert!(String::from_utf8_lossy(&help.stdout).contains("burn-for-relay-pass"));
     let bad = std::process::Command::new(bin)
         .arg("nope")
         .output()
@@ -414,7 +415,7 @@ fn cli_keygen_backup_recover_roundtrip() {
 
 #[test]
 fn burn_gate_end_to_end_cli_ticket_to_wire() {
-    // Node flow: bond + mint + burn (confirmed on the DAG) -> rendezvous
+    // Node flow: bond + mint + burn (confirmed on the DAG) -> relay pass
     // ticket. The wire server accepts only that ticket; a forged ticket
     // with valid HMAC but no confirmed burn gets 401.
     use turn_dag_turn::wire::attr_type;
@@ -445,8 +446,8 @@ fn burn_gate_end_to_end_cli_ticket_to_wire() {
     confirm_on(&mut node.dag, rep, burn).unwrap();
     assert!(node.dag.is_confirmed(&burn_h));
     let secret = b"gate-issuer-secret".to_vec();
-    // Ticket minted ONLY after confirmation (rendezvous() gates on it).
-    let cred = rendezvous(
+    // Ticket minted ONLY after confirmation (issue_relay_pass gates on it).
+    let cred = issue_relay_pass(
         &node.dag,
         secret.clone(),
         burn_h,

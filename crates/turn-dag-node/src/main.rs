@@ -13,7 +13,7 @@ USAGE:
   turn-dag-node mint
   turn-dag-node transfer
   turn-dag-node burn
-  turn-dag-node rendezvous
+  turn-dag-node relaypass   (burn -> 120s TURN credential; formerly 'rendezvous')
   turn-dag-node demo
   turn-dag-node stack
   turn-dag-node serve-udp [--addr 127.0.0.1:3478] [--relay-ip IP] [--user USER --pass PASS] [--rest-secret HEX --ticket ID] [--total-quota N]
@@ -22,7 +22,7 @@ USAGE:
   turn-dag-node backup --seed-file FILE [--out FILE]
   turn-dag-node recover --backup FILE [--seed-file FILE]
 Commands demonstrate node init/status, mint, transfer and the
-burn-for-rendezvous flow in-process on a virtual/smoltcp device or
+burn-for-relay-pass flow in-process on a virtual/smoltcp device or
 pure logic. No listener is opened.";
 
 fn main() {
@@ -263,7 +263,7 @@ fn run(cmd: &str) -> i32 {
             );
             0
         }
-        "mint" | "transfer" | "burn" | "rendezvous" | "demo" => flow(cmd),
+        "mint" | "transfer" | "burn" | "rendezvous" | "relaypass" | "demo" => flow(cmd),
         _ => {
             eprintln!("unknown command: {cmd}\n{HELP}");
             2
@@ -403,7 +403,7 @@ fn flow(cmd: &str) -> i32 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(2_000);
-    match rendezvous(
+    match issue_relay_pass(
         &alice.dag,
         b"demo-secret".to_vec(),
         burn_h,
@@ -414,7 +414,7 @@ fn flow(cmd: &str) -> i32 {
     ) {
         Ok(c) => {
             println!(
-                "rendezvous: ticket={} username={} expires_at={} max_bps={} byte_cap={}",
+                "relaypass: ticket={} username={} expires_at={} max_bps={} byte_cap={}",
                 c.ticket_id, c.username, c.expires_at, c.max_bps, c.byte_cap
             );
             println!(
@@ -424,7 +424,7 @@ fn flow(cmd: &str) -> i32 {
             0
         }
         Err(e) => {
-            eprintln!("rendezvous failed: {e:?}");
+            eprintln!("relaypass failed: {e:?}");
             1
         }
     }

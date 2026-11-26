@@ -1,8 +1,8 @@
 # turn-dag
 
-PoW pay-per-use TURN rendezvous on a DAG, with post-quantum wallets.
+PoW pay-per-use TURN relay passes on a DAG, with post-quantum wallets.
 
-Small DataChannel rendezvous only, not media. 1 indivisible mined element = 1 rendezvous, 120s, 16 kB/s. Elements cannot be subdivided, ownership can be transferred. Double spend across untrusted TURN servers is detected via DAG fork / fraud proof and penalized by bond slash.
+Small DataChannel relay only, not media. 1 indivisible mined element = 1 relay pass (a 120s credential; called "rendezvous" in the spec PDF - not grpc-dc's rendezvous endpoint), 16 kB/s. Elements cannot be subdivided, ownership can be transferred. Double spend across untrusted TURN servers is detected via DAG fork / fraud proof and penalized by bond slash.
 
 ## Spec
 
@@ -37,7 +37,7 @@ Implemented in Rust (workspace of 6 crates, no longer spec-only):
 - `turn-dag-dag`: block-lattice DAG, representative voting (≥67%, 5s epoch ticks), bonds, fraud proofs, slashing (1 bounty / 4 burned).
 - `turn-dag-minter`: Argon2id mint PoW, epoch-bound challenges, difficulty retarget.
 - `turn-dag-turn`: TURN issuer logic (120s credentials, quotas, SSRF denied-peer list), a smoltcp user-space stack on a virtual device, and a TURN wire server (`wire`: STUN framing + Allocate/Refresh/CreatePermission/ChannelBind/Send-Data, 120s cap, denied peers 403). No kernel TCP. Live servers: UDP relay (`serve-udp`) and `turns:` TLS 5349 (`serve-tls`, rustls over smoltcp TCP on a non-blocking TUN device).
-- `turn-dag-node`: CLI binary (`--help`, `init`, `status`, `mint`, `transfer`, `burn`, `rendezvous`, `demo`, `stack`) wiring all crates in-process.
+- `turn-dag-node`: CLI binary (`--help`, `init`, `status`, `mint`, `transfer`, `burn`, `relaypass`, `demo`, `stack`) wiring all crates in-process.
 
 Verify: `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, or `docker build -t turn-dag . && docker run --rm turn-dag test`.
 

@@ -8,9 +8,10 @@ before writing code. Implementation language is **Rust**.
 
 - Repo: https://github.com/browser-grpc/turn-dag
 - Public, Apache-2.0. Org: browser-grpc. Owner: unicomp21.
-- Goal: PoW pay-per-use TURN rendezvous on a DAG, with post-quantum wallets.
-- TURN is only for small DataChannel communication, i.e. rendezvous, not media.
-- 1 indivisible mined element = 1 rendezvous: 120s, 16 kB/s (`max-bps=16384`),
+- Goal: PoW pay-per-use TURN relay passes on a DAG, with post-quantum wallets.
+- Terminology: the burn-for-credential unit is a **relay pass** (`turn-dag-node relaypass`, `issue_relay_pass`); the spec PDF calls it "rendezvous", which now collides with grpc-dc's rendezvous (a pre-published fixed server endpoint), so docs/code prefer relay pass. The old CLI name and Rust fn remain as deprecated aliases.
+- TURN is only for small DataChannel communication (a relay pass), not media.
+- 1 indivisible mined element = 1 relay pass: 120s, 16 kB/s (`max-bps=16384`),
   ~1.9 MB max per direction, ~$0.00002 at $0.01/GB.
 - Elements cannot be subdivided. Ownership can be transferred.
   Wallet balance = count of elements owned. No amount field, no dust.
@@ -191,7 +192,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   browser credentials, public STUN controls (Google
   `stun.l.google.com:19302` + Cloudflare `stun.cloudflare.com:3478`,
   srflx candidates in both engines), and a real burn→challenge/PoW→
-  redeem→ticket→browser Allocate flow (`turn-dag-node rendezvous`
+  redeem→ticket→browser Allocate flow (`turn-dag-node relaypass`
   now mints credentials with wall-clock expiry). `tls-turns` SKIPs:
   no live 5349 listener exists yet (rustls-over-smoltcp only).
 - Hard gate: `scripts/browser-test.sh` (Docker `--network host`)

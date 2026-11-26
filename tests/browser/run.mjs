@@ -8,7 +8,7 @@
 //   expired       - expired issuer credential -> no relay candidate
 //   relay         - two PCs in isolated contexts, relay/relay DataChannel
 //   issuer        - credential from a real DAG burn -> TurnIssuer
-//                   challenge/PoW/redeem (turn-dag-node rendezvous) used
+//                   challenge/PoW/redeem (turn-dag-node relaypass) used
 //                   in-browser against a burn-gated serve-udp relay
 // Raw-wire sub-tests (Node UDP/STUN client against the live server):
 //   wire-allocate-lifetime (120s cap), wire-tcp-refused (442),
@@ -583,25 +583,25 @@ try {
   await waitListening(startServer(['serve-udp', '--addr', `0.0.0.0:${PORT}`, '--relay-ip', HOST, '--user', USER, '--pass', PASS]), 'static TURN server');
   await waitListening(startServer(['serve-udp', '--addr', `0.0.0.0:${QUOTA_PORT}`, '--relay-ip', HOST, '--user', USER, '--pass', PASS, '--total-quota', '2']), 'quota TURN server');
 
-  // Issuer credential: one real rendezvous run (burn -> challenge/PoW
+  // Issuer credential: one real relaypass run (burn -> challenge/PoW
   // -> redeem). The CLI flow is deterministic, so a second run would
   // mint the identical ticket; the raw-wire REST tests use a separate
   // relay-registered ticket (rawTicket) to avoid colliding with the
   // browser's live allocation on the same ticket.
   const secretHex = Buffer.from('demo-secret').toString('hex');
-  const out = await runCli(['rendezvous']);
+  const out = await runCli(['relaypass']);
   const ticket = out.match(/ticket=([0-9a-f]+)/)?.[1];
   const username = out.match(/username=(\S+)/)?.[1];
   const expires = Number(out.match(/expires_at=(\d+)/)?.[1] || 0);
   if (!ticket || !username || expires < Math.floor(Date.now() / 1000) + 30) {
-    throw new Error(`rendezvous CLI gave no live credential: ${out.slice(0, 300)}`);
+    throw new Error(`relaypass CLI gave no live credential: ${out.slice(0, 300)}`);
   }
   const issuerCreds = [{ ticket, username, password: credFor(username, 'demo-secret'), expires }];
   const rawTicket = 'rawwireticket1';
   const rawUser = `${Math.floor(Date.now() / 1000) + 3600}:pow:${rawTicket}`;
   const pairTicket = 'pairticket00001';
   const pairUser = `${Math.floor(Date.now() / 1000) + 3600}:pow:${pairTicket}`;
-  record('issuer:cli-rendezvous', 'PASS', `burn-gated ticket=${ticket} expires_at=${expires}`);
+  record('issuer:cli-relaypass', 'PASS', `burn-gated ticket=${ticket} expires_at=${expires}`);
   await waitListening(startServer(['serve-udp', '--addr', `0.0.0.0:${REST_PORT}`, '--relay-ip', HOST, '--rest-secret', secretHex, '--ticket', ticket, '--ticket', rawTicket, '--ticket', pairTicket]), 'REST/burn-gated TURN server');
 
   // ---------- raw wire sub-tests (static server) ----------
@@ -773,10 +773,10 @@ try {
       if (name === ENGINES[0]) {
         // Fresh issuer credential (same deterministic ticket, new
         // 120s window): earlier sub-tests can outlive the first mint.
-        const freshOut = await runCli(['rendezvous']);
+        const freshOut = await runCli(['relaypass']);
         const fUser = freshOut.match(/username=(\S+)/)?.[1];
         const fExp = Number(freshOut.match(/expires_at=(\d+)/)?.[1] || 0);
-        if (!fUser || fExp < Math.floor(Date.now() / 1000) + 20) throw new Error(`fresh rendezvous credential not live: ${freshOut.slice(0, 200)}`);
+        if (!fUser || fExp < Math.floor(Date.now() / 1000) + 20) throw new Error(`fresh relaypass credential not live: ${freshOut.slice(0, 200)}`);
         const iss = await gatherOnce(page1, turnCfg(fUser, credFor(fUser, 'demo-secret'), REST_PORT), GATHER_TIMEOUT_MS);
         const issRelay = iss.cands.filter((c) => c.includes('typ relay'));
         recordNet('issuer:browser-gather', iss.state === 'complete' && issRelay.length > 0,
@@ -859,7 +859,7 @@ try {
     await crossRelay('cross:firefox-chromium', 'firefox', firefox, 'chromium', chromium, turnCfg(USER, PASS), 32768, false);
     // Issuer-credential pair: Firefox holds a fresh DAG-burn ticket,
     // Chromium a second relay-registered ticket, over the burn gate.
-    const freshOut2 = await runCli(['rendezvous']);
+    const freshOut2 = await runCli(['relaypass']);
     const fUser2 = freshOut2.match(/username=(\S+)/)?.[1];
     if (fUser2) {
       await crossRelay('issuer:relay-pair', 'firefox', firefox, 'chromium', chromium,

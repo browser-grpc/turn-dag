@@ -144,8 +144,11 @@ pub fn demo_policy() -> AllocationPolicy {
     }
 }
 
-/// Full burn-for-rendezvous flow on one node view. Returns credential username.
-pub fn rendezvous(
+/// Full burn-for-relay-pass flow on one node view: a confirmed burn
+/// redeemed (issuer challenge/PoW/redeem) for a 120s TURN credential.
+/// This is turn-dag's "relay pass" - not grpc-dc's rendezvous (a
+/// pre-published fixed server endpoint); the name differs on purpose.
+pub fn issue_relay_pass(
     dag: &Dag,
     secret: Vec<u8>,
     burn_hash: [u8; 32],
@@ -178,6 +181,22 @@ pub fn rendezvous(
     let resp = issuer.handle_post_redeem(&req, now);
     let creds = resp.body?;
     Ok(creds.into_iter().next().expect("one credential"))
+}
+
+/// Deprecated alias for [`issue_relay_pass`] (the concept was renamed
+/// from "rendezvous" to "relay pass" to avoid confusion with
+/// grpc-dc's rendezvous endpoint).
+#[deprecated(note = "renamed to issue_relay_pass")]
+pub fn rendezvous(
+    dag: &Dag,
+    secret: Vec<u8>,
+    burn_hash: [u8; 32],
+    user: &str,
+    client_ip: std::net::IpAddr,
+    peer_ip: std::net::IpAddr,
+    now: u64,
+) -> Result<turn_dag_turn::TurnCredential, turn_dag_turn::RedeemError> {
+    issue_relay_pass(dag, secret, burn_hash, user, client_ip, peer_ip, now)
 }
 
 /// Mint one element via real Argon2id (cheap params) + confirmed Mint block.
@@ -240,10 +259,10 @@ mod tests {
     }
 
     #[test]
-    fn rendezvous_rejects_unconfirmed_burn_and_denied_peer() {
+    fn relay_pass_rejects_unconfirmed_burn_and_denied_peer() {
         let n = Node::new("r", 44);
         let client: std::net::IpAddr = "203.0.113.1".parse().unwrap();
-        let err = rendezvous(
+        let err = issue_relay_pass(
             &n.dag,
             b"s3cret".to_vec(),
             [2u8; 32],
