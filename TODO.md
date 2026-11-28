@@ -258,7 +258,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 - Verified: `cargo test --workspace` (92 tests after the ledger cutover), clippy, fmt,
   `docker build --target ci`, and
   `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
-  (52 passed, 3 skipped — Firefox + WebKit turns and fresh-context
+  (62 passed, 3 skipped — Firefox + WebKit turns and fresh-context
   passkey sync — 0 failed).
 
 ## Virtual network, rate limiting, scale, CI gate (2026-11-25)
@@ -396,11 +396,33 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   Suite: `tcp:dedicated-upstream-only`, `*:turn-tcp-gather`,
   `grpc:{firefox,chromium,webkit}-echo-over-turn-tcp`
   (all pass, selected pair `relay/host`).
-- Suite total is now 59 passed / 3 skipped (Firefox + WebKit
-  turns and fresh-context); cargo runs 151 tests including the
+- Suite total is now 62 passed / 3 skipped (Firefox + WebKit
+  turns and fresh-context); cargo runs 153 tests including the
   vendored crates' unit tests (path deps under the workspace
   root are auto-members; their sources carry crate-level lint
   allowances since upstream's clippy baseline differs).
+
+## Pub/sub with git branches as logs (2026-11-26)
+
+- The embedded grpc-dc server now also serves
+  `grpcdc.events.v1.EventBus` Publish/Subscribe via
+  `GitEventBusBroker` (`crates/turn-dag-node/src/git_event_bus.rs`).
+- The broker uses grpc-dc's established git format: branch
+  `grpc-dc-events` by default, one commit per event, authoritative
+  `event.pb` blob, sequence/publisher/tag trailers. Publishing
+  appends to git *before* fan-out; subscribing registers under the
+  broker lock, replays matching branch history in sequence order,
+  then continues with live events. A restart reopens the same repo
+  and resumes sequence assignment from the branch tip. Tag filters
+  retain grpcdc containment semantics; subscriber queues retain
+  the upstream bounded drop-oldest policy for live delivery.
+- `serve-grpc` options: `--event-log DIR` (default
+  `turndag-event-log`; mount/persist this directory in production)
+  and `--event-branch BRANCH`.
+- Browser coverage does this over TURN/TCP only: tag-filtered live
+  delivery (`o1`, noise on another topic, `o2`) and a fresh
+  subscription replaying `o1,o2` from git before receiving live
+  `o3`, in Firefox, Chromium, and WebKit.
 
 ## Decisions (settled 2026-11-25, "go all, pick as needed")
 

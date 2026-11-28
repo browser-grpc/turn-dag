@@ -1402,6 +1402,33 @@ try {
               `Echo over TURN/TCP only, pair=${result?.pairType}`,
               JSON.stringify(result).slice(0, 250));
           }
+
+          const topic = `orders-${name}-${Date.now()}`;
+          const pubSubCall = pg.evaluate(
+            async ({ d, t, u, p, topic }) => window.__grpcPubSub(d, t, u, p, topic),
+            { d: grpcDescriptor, t: turnTcpUrl, u: USER, p: PASS, topic },
+          );
+          const pubSub = await Promise.race([
+            pubSubCall,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('grpc pub/sub timeout')), 90000)),
+          ]).catch((e) => ({ error: String(e).slice(0, 250) }));
+          const liveOk = pubSub?.live?.map((e) => e.payload).join(',') === 'o1,o2'
+            && pubSub?.live?.[0]?.seq === pubSub?.seqs?.[0]
+            && pubSub?.live?.[1]?.seq === pubSub?.seqs?.[2];
+          const replayOk = pubSub?.replayed?.map((e) => e.payload).join(',') === 'o1,o2,o3'
+            && pubSub?.replayed?.[0]?.seq === pubSub?.seqs?.[0]
+            && pubSub?.replayed?.[1]?.seq === pubSub?.seqs?.[2]
+            && pubSub?.replayed?.[2]?.seq === pubSub?.seqs?.[3];
+          const pubSubOk = liveOk && replayOk
+            && pubSub?.pairType?.startsWith('relay/')
+            && pubSub?.pairType2?.startsWith('relay/');
+          if (name === 'webkit' && !pubSubOk) {
+            record('grpc:webkit-pubsub-over-turn-tcp', 'SKIP', `WebKit pub/sub over TURN/TCP unsupported here: ${JSON.stringify(pubSub).slice(0, 220)}`);
+          } else {
+            recordNet(`grpc:${name}-pubsub-over-turn-tcp`, !!pubSubOk,
+              `git-branch EventBus live+replay over TURN/TCP, seqs=${pubSub?.seqs?.join(',')}`,
+              JSON.stringify(pubSub).slice(0, 300));
+          }
         }
       } catch (e) {
         if (name === 'webkit') record('webkit:turn-tcp-gather', 'SKIP', `launch/gather failed: ${String(e).slice(0, 180)}`);

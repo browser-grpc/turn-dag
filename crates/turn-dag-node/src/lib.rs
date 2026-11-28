@@ -10,6 +10,8 @@
 //! a relay pass is issued only against a burn recorded in that
 //! node's own ledger, and a foreign node's coins are simply absent.
 
+pub mod git_event_bus;
+
 use turn_dag_element::ElementId;
 use turn_dag_ledger::{BurnReceipt, Ledger};
 use turn_dag_turn::{AllocationPolicy, BurnConfirmation, TurnIssuer};

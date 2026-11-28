@@ -21,7 +21,7 @@ USAGE:
   turn-dag-node serve-udp [--addr 127.0.0.1:3478] [--relay-ip IP] [--user USER --pass PASS] [--rest-secret HEX --ticket ID] [--total-quota N]
   turn-dag-node serve-tls --cert CERT.pem --key KEY.pem [--tun turndag0] [--ip 10.99.0.1] [--port 5349] [--user USER --pass PASS]
   turn-dag-node serve-tcp [--tun turndag1] [--ip 10.99.1.1] [--port 3478] [--user USER --pass PASS] [--rest-secret HEX --ticket ID] [--allow-peer IP]
-  turn-dag-node serve-grpc [--tun turndag1] [--ip 10.99.1.1] [--host-ip 10.99.1.2] [--turn-port 3478] [--grpc-port 50051] [--descriptor-out FILE] [--user USER --pass PASS]
+  turn-dag-node serve-grpc [--tun turndag1] [--ip 10.99.1.1] [--host-ip 10.99.1.2] [--turn-port 3478] [--grpc-port 50051] [--descriptor-out FILE] [--event-log DIR] [--event-branch BRANCH] [--user USER --pass PASS]
   turn-dag-node keygen [--out FILE] [--backup FILE]
   turn-dag-node backup --seed-file FILE [--out FILE]
   turn-dag-node recover --backup FILE [--seed-file FILE]
@@ -607,6 +607,8 @@ fn serve_grpc(args: &[String]) -> i32 {
     let mut rest_secret: Option<String> = None;
     let mut burn_tickets: Vec<String> = Vec::new();
     let mut descriptor_out: Option<String> = None;
+    let mut event_log = "turndag-event-log".to_string();
+    let mut event_branch = grpc_dc::eventbus_git::EVENT_LOG_BRANCH.to_string();
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -616,6 +618,8 @@ fn serve_grpc(args: &[String]) -> i32 {
             "--turn-port" => turn_port = it.next().and_then(|v| v.parse().ok()).unwrap_or(3478),
             "--grpc-port" => grpc_port = it.next().and_then(|v| v.parse().ok()).unwrap_or(50051),
             "--descriptor-out" => descriptor_out = it.next().cloned(),
+            "--event-log" => event_log = it.next().cloned().unwrap_or_default(),
+            "--event-branch" => event_branch = it.next().cloned().unwrap_or_default(),
             "--user" => user = it.next().cloned(),
             "--pass" => pass = it.next().cloned(),
             "--rest-secret" => rest_secret = it.next().cloned(),
@@ -650,9 +654,26 @@ fn serve_grpc(args: &[String]) -> i32 {
     // and the TURN server is in dedicated-upstream mode for
     // exactly that socket address: browsers reach it by allocating
     // on TURN/TCP, while every other relay destination is refused.
+    let event_broker = match turn_dag_node::git_event_bus::GitEventBusBroker::open_branch(
+        &event_log,
+        &event_branch,
+    ) {
+        Ok(broker) => broker,
+        Err(e) => {
+            eprintln!("git event log open failed: {e}");
+            return 1;
+        }
+    };
+    let event_stats = event_broker.stats();
+    println!(
+        "eventbus: git repo={event_log} branch={event_branch} replayed_seq={}",
+        event_stats.last_seq
+    );
+    let mut grpc_services = grpc_echo::echo_services();
+    grpc_services.push(event_broker.service());
     let grpc_listener = match grpc_dc::rendezvous::serve_rendezvous_with(
         &format!("0.0.0.0:{grpc_port}"),
-        grpc_echo::echo_services(),
+        grpc_services,
         dc_webrtc::rendezvous::RendezvousOptions::default,
     ) {
         Ok(l) => l,
@@ -693,8 +714,10 @@ fn serve_grpc(args: &[String]) -> i32 {
             return 1;
         }
     };
-    // Keep the gRPC listener alive for the process lifetime.
+    // Keep the gRPC listener and its git-backed broker alive for
+    // the process lifetime (service handlers also hold broker Arcs).
     let _grpc_listener = grpc_listener;
+    let _event_broker = event_broker;
     println!(
         "serve-grpc listening turn-tcp {ip}:{turn_port} dedicated-upstream {host_ip}:{grpc_port}"
     );
