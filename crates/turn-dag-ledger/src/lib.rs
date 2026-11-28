@@ -79,6 +79,8 @@ pub struct Entry {
 
 /// Origin-signed attestation that an element was burned at `seq`.
 /// The relay-pass gate checks a receipt's hash against the ledger.
+/// Receipts cross process/machine boundaries, so they have a
+/// canonical CBOR encoding (`to_cbor`/`from_cbor`, serde).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BurnReceipt {
     pub element_id: ElementId,
@@ -90,7 +92,57 @@ pub struct BurnReceipt {
     pub origin_sig: Vec<u8>,
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct BurnReceiptWire {
+    element_id: serde_bytes::ByteArray<32>,
+    entry_hash: serde_bytes::ByteArray<32>,
+    seq: u64,
+    origin: serde_bytes::ByteArray<20>,
+    origin_pubkey: serde_bytes::ByteBuf,
+    origin_sig: serde_bytes::ByteBuf,
+}
+
+impl From<&BurnReceipt> for BurnReceiptWire {
+    fn from(r: &BurnReceipt) -> Self {
+        Self {
+            element_id: serde_bytes::ByteArray::from(r.element_id.0),
+            entry_hash: serde_bytes::ByteArray::from(r.entry_hash),
+            seq: r.seq,
+            origin: serde_bytes::ByteArray::from(r.origin.0),
+            origin_pubkey: serde_bytes::ByteBuf::from(r.origin_pubkey.clone()),
+            origin_sig: serde_bytes::ByteBuf::from(r.origin_sig.clone()),
+        }
+    }
+}
+
+impl From<BurnReceiptWire> for BurnReceipt {
+    fn from(w: BurnReceiptWire) -> Self {
+        Self {
+            element_id: ElementId(w.element_id.into_array()),
+            entry_hash: w.entry_hash.into_array(),
+            seq: w.seq,
+            origin: PqAddress(w.origin.into_array()),
+            origin_pubkey: w.origin_pubkey.into_vec(),
+            origin_sig: w.origin_sig.into_vec(),
+        }
+    }
+}
+
 impl BurnReceipt {
+    /// Canonical CBOR encoding (byte strings, not arrays).
+    pub fn to_cbor(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        ciborium::into_writer(&BurnReceiptWire::from(self), &mut out)
+            .expect("CBOR encoding of a receipt cannot fail");
+        out
+    }
+
+    /// Decode a CBOR receipt; errors on malformed input, never panics.
+    pub fn from_cbor(bytes: &[u8]) -> Result<Self, ciborium::de::Error<std::io::Error>> {
+        let wire: BurnReceiptWire = ciborium::from_reader(bytes)?;
+        Ok(wire.into())
+    }
+
     /// Third-party verification: the receipt really is signed by
     /// the origin key it claims (ledger-existence is checked by
     /// `Ledger::verify_receipt` / `is_burned`).
@@ -421,6 +473,26 @@ mod tests {
         receipt.entry_hash[0] ^= 1;
         assert!(!a.verify_receipt(&receipt));
         assert!(!receipt.verify_signature());
+    }
+
+    #[test]
+    fn burn_receipt_cbor_roundtrip() {
+        let origin = wallet(1);
+        let alice = wallet(2);
+        let mut l = Ledger::new(origin.address());
+        let eid = ElementId([42u8; 32]);
+        l.mint(eid, &alice, &origin).unwrap();
+        let receipt = l.burn(eid, &alice, &origin).unwrap();
+        let bytes = receipt.to_cbor();
+        let back = BurnReceipt::from_cbor(&bytes).unwrap();
+        assert_eq!(back, receipt);
+        assert!(back.verify_signature());
+        // Malformed input is an error, never a panic.
+        assert!(BurnReceipt::from_cbor(&bytes[..bytes.len() / 2]).is_err());
+        assert!(BurnReceipt::from_cbor(b"not cbor at all").is_err());
+        // Byte-string encoding keeps it close to raw field sizes
+        // (pubkey 1952 + sig 3309 dominate; framing adds only bytes).
+        assert!(bytes.len() < 1952 + 3309 + 200, "cbor len {}", bytes.len());
     }
 
     #[test]

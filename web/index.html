@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>turn-dag browser wallet (WebAuthn PRF + PQ)</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 2rem auto; max-width: 44rem; padding: 0 1rem; }
+  button { margin: 0.25rem 0.25rem 0.25rem 0; padding: 0.5rem 1rem; }
+  code, pre { background: #f4f4f4; padding: 0.2rem 0.4rem; word-break: break-all; white-space: pre-wrap; }
+  .row { margin: 1rem 0; }
+  label { display: block; font-size: 0.85rem; color: #444; }
+  input { width: 100%; padding: 0.4rem; }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "hash-wasm": "/vendor/hash-wasm/dist/index.esm.js",
+    "@noble/post-quantum/": "/vendor/@noble/post-quantum/",
+    "@noble/hashes/": "/vendor/@noble/hashes/",
+    "@noble/curves/": "/vendor/@noble/curves/"
+  }
+}
+</script>
+</head>
+<body>
+<h1>turn-dag browser wallet</h1>
+<p>Post-quantum keys derived in your browser from a passkey:
+WebAuthn <strong>register/auth + PRF</strong> produces the seed;
+ML-DSA-65 keys are derived locally. All proof-of-work
+(TURN SHA-256 and Argon2id mint) is also solved here in the
+browser - the Rust node only verifies.</p>
+
+<div class="row">
+  <button id="btn-register">1. Register passkey (PRF)</button>
+  <button id="btn-unlock">2. Unlock with passkey</button>
+</div>
+<div class="row">
+  <label>Wallet address (SHA3-256 of ML-DSA-65 pubkey, first 20 bytes)</label>
+  <pre id="address">-</pre>
+  <label>Seed source</label>
+  <pre id="seed-source">-</pre>
+</div>
+
+<h2>Proof of work (solved in this page)</h2>
+<div class="row">
+  <label>TURN PoW challenge (hex, from <code>turn-dag-node pow-challenge</code>)</label>
+  <input id="pow-challenge" value="">
+  <label>bits</label>
+  <input id="pow-bits" value="12" size="4">
+  <button id="btn-turn-pow">Solve TURN PoW</button>
+  <pre id="turn-pow-out">-</pre>
+</div>
+<div class="row">
+  <label>Mint PoW challenge (hex, from <code>turn-dag-node mint-challenge</code>)</label>
+  <input id="mint-challenge" value="">
+  <label>difficulty</label>
+  <input id="mint-difficulty" value="16" size="6">
+  <button id="btn-mint-pow">Solve mint PoW (Argon2id)</button>
+  <pre id="mint-pow-out">-</pre>
+</div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

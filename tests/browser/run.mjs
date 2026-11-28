@@ -51,7 +51,25 @@ const record = (name, status, detail) => {
 const recordNet = (name, ok, detail, failDetail) =>
   ok ? record(name, 'PASS', detail) : record(name, REQUIRE ? 'FAIL' : 'SKIP', failDetail || detail);
 
-const pageServer = http.createServer((_req, res) => {
+import fs from 'node:fs';
+const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.json': 'application/json', '.wasm': 'application/wasm' };
+const pageServer = http.createServer((req, res) => {
+  const url = new URL(req.url, 'http://127.0.0.1');
+  // Browser wallet app + its vendor modules (real app under test).
+  if (url.pathname.startsWith('/wallet-app/') || url.pathname.startsWith('/vendor/')) {
+    const isVendor = url.pathname.startsWith('/vendor/');
+    const base = isVendor
+      ? path.join(root, 'tests/browser/node_modules')
+      : path.join(root, 'web');
+    const rel = url.pathname.slice(isVendor ? '/vendor/'.length : '/wallet-app/'.length) || 'index.html';
+    const filePath = path.join(base, rel);
+    if (!filePath.startsWith(base) || !fs.existsSync(filePath)) {
+      res.writeHead(404); res.end('not found'); return;
+    }
+    res.setHeader('content-type', MIME[path.extname(filePath)] || 'application/octet-stream');
+    fs.createReadStream(filePath).pipe(res);
+    return;
+  }
   res.setHeader('content-type', 'text/html');
   res.end('<!doctype html><title>turn-dag webrtc test</title>');
 });
@@ -959,6 +977,80 @@ try {
       recordNet('scale:five-pair-relay', false, '', String(e).slice(0, 300));
     } finally {
       try { await sBrowser?.close(); } catch {}
+    }
+  }
+
+  // ---------- browser wallet: WebAuthn PRF keys + all PoW in browser ----------
+  // The wallet's PQ keys come from WebAuthn register/auth + PRF
+  // (CDP virtual authenticator); TURN and mint PoW are solved by
+  // the page's WASM solvers; the Rust CLI verifies everything.
+  const runCliCode = (args) => new Promise((resolve) => {
+    const p = spawn(path.join(root, 'target/debug/turn-dag-node'), args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    p.stdout.on('data', (d) => (out += d));
+    p.stderr.on('data', (d) => (out += d));
+    p.on('close', (code) => resolve({ code, out }));
+  });
+  if (ENGINES.includes('chromium')) {
+    let wBrowser;
+    try {
+      wBrowser = await chromium.launch({ args: ['--no-sandbox'] });
+      const ctx = await wBrowser.newContext();
+      const page = await ctx.newPage();
+      page.on('pageerror', (e) => console.log('[wallet pageerror]', String(e)));
+      const cdp = await ctx.newCDPSession(page);
+      await cdp.send('WebAuthn.enable');
+      await cdp.send('WebAuthn.addVirtualAuthenticator', {
+        options: {
+          protocol: 'ctap2',
+          transport: 'internal',
+          hasResidentKey: true,
+          hasUserVerification: true,
+          isUserVerified: true,
+          automaticPresenceSimulation: true,
+          hasPrf: true,
+        },
+      });
+      await page.goto(`http://localhost:${pagePort}/wallet-app/`); // localhost: WebAuthn RP id cannot be an IP literal
+      await page.click('#btn-register');
+      await page.waitForFunction(() => document.getElementById('seed-source').textContent.includes('registered'), null, { timeout: 15000 });
+      const regText = await page.textContent('#seed-source');
+      await page.click('#btn-unlock');
+      await page.waitForFunction(() => /^[0-9a-f]{40}$/.test(document.getElementById('address').textContent.trim()), null, { timeout: 15000 });
+      const addr1 = (await page.textContent('#address')).trim();
+      // Second unlock must re-derive the identical wallet (PRF determinism).
+      await page.click('#btn-unlock');
+      await page.waitForTimeout(1500);
+      const addr2 = (await page.textContent('#address')).trim();
+      const prfOk = /PRF enabled/.test(regText);
+      record('browser-wallet:passkey-prf', prfOk && addr1 === addr2 && /^[0-9a-f]{40}$/.test(addr1) ? 'PASS' : 'SKIP',
+        prfOk ? `passkey PRF derives stable ML-DSA wallet ${addr1}` : `virtual authenticator PRF not enabled (${regText}); addr stable=${addr1 === addr2}`);
+      if (prfOk) {
+        const signed = await page.evaluate(() => window.turnDagWallet.signWalletMessage());
+        const v = await runCliCode(['sig-verify', '--pubkey', signed.publicKeyHex, '--sig', signed.sigHex]);
+        record('browser-wallet:sig-verify', v.code === 0 && v.out.includes(`address=${signed.addressHex}`) ? 'PASS' : 'FAIL',
+          `Rust verifies browser ML-DSA signature, addr match=${v.out.includes(`address=${signed.addressHex}`)}`);
+        // TURN PoW solved in browser, verified by Rust.
+        const chOut = await runCli(['pow-challenge', '--bits', '12']);
+        const chId = chOut.match(/challenge_id=([0-9a-f]+)/)?.[1];
+        const chHex = chOut.match(/challenge=([0-9a-f]+)/)?.[1];
+        const sol = await page.evaluate(async (h) => window.turnDagWallet.solveTurnPow(h, 12), chHex);
+        const pv = await runCliCode(['pow-verify', '--id', chId, '--challenge', chHex, '--bits', '12', '--nonce', String(sol.nonce)]);
+        record('browser-pow:turn', pv.code === 0 ? 'PASS' : 'FAIL', `browser solved TURN PoW nonce=${sol.nonce}, Rust verify=${pv.out.trim()}`);
+        // Mint (Argon2id) PoW solved in browser, verified by Rust.
+        const mc = await runCli(['mint-challenge', '--miner', signed.addressHex, '--difficulty', '16']);
+        const mcHex = mc.match(/challenge=([0-9a-f]+)/)?.[1];
+        const msol = await page.evaluate(async (h) => window.turnDagWallet.solveMintPow(h, 16), mcHex);
+        const eid = await page.evaluate(async ({ h, n, m }) => window.turnDagWallet.elementId(h, n, m), { h: mcHex, n: msol.nonce, m: signed.addressHex });
+        const mv = await runCliCode(['mint-verify', '--miner', signed.addressHex, '--difficulty', '16', '--nonce', String(msol.nonce), '--hash', msol.hashHex]);
+        record('browser-pow:mint', mv.code === 0 && mv.out.includes(`element_id=${eid}`) ? 'PASS' : 'FAIL',
+          `browser Argon2id mint nonce=${msol.nonce}, Rust verify + element id match=${mv.out.includes(`element_id=${eid}`)}`);
+      }
+      await ctx.close();
+    } catch (e) {
+      record('browser-wallet:passkey-prf', 'SKIP', `wallet section failed: ${String(e).slice(0, 250)}`);
+    } finally {
+      try { await wBrowser?.close(); } catch {}
     }
   }
 

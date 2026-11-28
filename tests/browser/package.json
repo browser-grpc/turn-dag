@@ -6,6 +6,9 @@
     "test": "node run.mjs"
   },
   "devDependencies": {
+    "@noble/hashes": "^2.4.0",
+    "@noble/post-quantum": "^0.7.1",
+    "hash-wasm": "^4.13.0",
     "playwright": "1.63.0"
   }
 }

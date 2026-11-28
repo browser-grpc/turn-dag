@@ -255,10 +255,10 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   ChannelData stream framing in `take_frame`). Firefox turns:
   SKIPs with evidence — packet capture shows this Firefox build
   attempts `turn:?transport=tcp` but never initiates `turns:`.
-- Verified: `cargo test --workspace` (87 tests after the ledger cutover), clippy, fmt,
+- Verified: `cargo test --workspace` (88 tests after the ledger cutover), clippy, fmt,
   `docker build --target ci`, and
   `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
-  (41 passed, 1 skipped — Firefox turns — 0 failed).
+  (45 passed, 1 skipped — Firefox turns — 0 failed).
 
 ## Virtual network, rate limiting, scale, CI gate (2026-11-25)
 
@@ -282,6 +282,30 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   Blink (Chromium), Gecko (Firefox), and WebKit — every shipping
   engine family; Edge is Blink, and Playwright WebKit approximates
   (does not equal) real Safari, which no CI here can run.
+
+## Browser wallet + browser PoW (2026-11-26)
+
+- The browser PQ wallet is **WebAuthn-based**: `web/` registers a
+  passkey with the PRF extension, auth evaluates PRF over a fixed
+  domain salt, HKDF expands the output into the ML-DSA-65 seed
+  (@noble/post-quantum). Same passkey → same wallet address
+  (SHA3-256(pubkey)[..20], matching the Rust derivation). No silent
+  seed fallback: without PRF the wallet refuses to derive keys.
+  Note: WebAuthn needs the `localhost` origin (IP-literal RP IDs
+  are rejected), and Chromium's CDP virtual authenticator needs
+  `hasPrf: true` to exercise the real flow in tests.
+- **All PoW happens in the browser**: TURN PoW (SHA-256) and mint
+  PoW (Argon2id at the minter's cheap params) are solved in-page
+  via hash-wasm; the Rust node only verifies. Stateless CLI
+  oracles: `pow-challenge`/`pow-verify`, `mint-challenge`/
+  `mint-verify`, `sig-verify --pubkey`. Playwright sub-tests
+  (`browser-wallet:*`, `browser-pow:*`) run the real register →
+  auth/PRF → sign → solve flows against those oracles.
+- Serialized cross-party artifacts use **CBOR (serde/ciborium)**
+  where serialization is needed, starting with `BurnReceipt`
+  (`to_cbor`/`from_cbor`, byte-string fields, canonical roundtrip
+  test). Key references stay hash-based where appropriate:
+  a 20-byte SHA3-256 digest stands in for the 1,952-byte pubkey.
 
 ## Decisions (settled 2026-11-25, "go all, pick as needed")
 

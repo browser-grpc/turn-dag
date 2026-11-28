@@ -6,6 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+serde_bytes = "0.11"
 sha3.workspace = true
 turn-dag-element = { path = "../turn-dag-element" }
 turn-dag-wallet = { path = "../turn-dag-wallet" }

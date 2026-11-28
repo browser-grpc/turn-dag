@@ -37,6 +37,8 @@ Implemented in Rust (workspace of 6 crates, no longer spec-only):
 - `turn-dag-turn`: TURN issuer logic (120s credentials, quotas, SSRF denied-peer list), a smoltcp user-space stack on a virtual device, and a TURN wire server (`wire`: STUN framing + Allocate/Refresh/CreatePermission/ChannelBind/Send-Data, 120s cap, denied peers 403). No kernel TCP. Live servers: UDP relay (`serve-udp`) and `turns:` TLS 5349 (`serve-tls`, rustls over smoltcp TCP on a non-blocking TUN device).
 - `turn-dag-node`: CLI binary (`--help`, `init`, `status`, `mint`, `transfer`, `burn`, `relaypass`, `demo`, `stack`) wiring all crates in-process.
 
+Browser wallet (`web/`): passkey-derived PQ keys (WebAuthn register/auth + PRF → ML-DSA-65) with all proof-of-work solved in the browser and verified by the Rust CLI oracles. Run it with `node web/server.mjs`, then open http://localhost:8471 (WebAuthn requires the localhost origin).
+
 Verify: `cargo test --workspace`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo fmt --all -- --check`, or `docker build -t turn-dag . && docker run --rm turn-dag test`.
 
 ## License

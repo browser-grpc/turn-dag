@@ -42,7 +42,220 @@ fn main() {
     if cmd == "recover" {
         std::process::exit(recover(&args[2..]));
     }
+    if cmd == "pow-challenge" {
+        std::process::exit(pow_challenge(&args[2..]));
+    }
+    if cmd == "pow-verify" {
+        std::process::exit(pow_verify(&args[2..]));
+    }
+    if cmd == "mint-challenge" {
+        std::process::exit(mint_challenge_cmd(&args[2..]));
+    }
+    if cmd == "mint-verify" {
+        std::process::exit(mint_verify_cmd(&args[2..]));
+    }
+    if cmd == "sig-verify" {
+        std::process::exit(sig_verify_cmd(&args[2..]));
+    }
     std::process::exit(run(cmd));
+}
+
+fn arg_val(args: &[String], name: &str) -> Option<String> {
+    args.windows(2).find(|w| w[0] == name).map(|w| w[1].clone())
+}
+
+fn pow_challenge(args: &[String]) -> i32 {
+    let bits: u32 = arg_val(args, "--bits")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    let ip: IpAddr = arg_val(args, "--ip")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or("203.0.113.10".parse().unwrap());
+    let checker = turn_dag_turn::NeverConfirmed;
+    let policy = turn_dag_turn::AllocationPolicy {
+        pow_bits: bits,
+        ..demo_policy()
+    };
+    let mut issuer = turn_dag_turn::TurnIssuer::new(b"demo-secret".to_vec(), policy, &checker);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match issuer.handle_get_challenge(ip, now).body {
+        Ok(ch) => {
+            println!("challenge_id={}", hex(&ch.challenge_id));
+            println!("challenge={}", hex(&ch.challenge));
+            println!("bits={}", ch.bits);
+            println!("expires_at={}", ch.expires_at);
+            0
+        }
+        Err(e) => {
+            eprintln!("pow-challenge failed: {e:?}");
+            1
+        }
+    }
+}
+
+fn pow_verify(args: &[String]) -> i32 {
+    let Some(id) = arg_val(args, "--id").and_then(|v| hex_decode(&v)) else {
+        eprintln!("pow-verify needs --id HEX16");
+        return 2;
+    };
+    let Some(challenge) = arg_val(args, "--challenge").and_then(|v| hex_decode(&v)) else {
+        eprintln!("pow-verify needs --challenge HEX32");
+        return 2;
+    };
+    let bits: u32 = arg_val(args, "--bits")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(12);
+    let Some(nonce) = arg_val(args, "--nonce").and_then(|v| v.parse::<u64>().ok()) else {
+        eprintln!("pow-verify needs --nonce N");
+        return 2;
+    };
+    if id.len() != 16 || challenge.len() != 32 {
+        eprintln!("bad challenge lengths");
+        return 2;
+    }
+    let ch = turn_dag_turn::TurnPowChallenge {
+        challenge_id: id.try_into().unwrap(),
+        challenge: challenge.try_into().unwrap(),
+        client_ip: "127.0.0.1".parse().unwrap(),
+        issued_at: 0,
+        expires_at: u64::MAX,
+        bits,
+    };
+    let sol = turn_dag_turn::TurnPowSolution {
+        challenge_id: ch.challenge_id,
+        nonce,
+    };
+    if turn_dag_turn::verify_turn_pow(&ch, &sol) {
+        println!("pow-verify: PASS");
+        0
+    } else {
+        println!("pow-verify: FAIL");
+        1
+    }
+}
+
+fn parse_addr(hex20: &str) -> Option<turn_dag_wallet::PqAddress> {
+    let b = hex_decode(hex20)?;
+    if b.len() != 20 {
+        return None;
+    }
+    Some(turn_dag_wallet::PqAddress(b.try_into().unwrap()))
+}
+
+fn mint_challenge_cmd(args: &[String]) -> i32 {
+    let epoch: u64 = arg_val(args, "--epoch")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let difficulty: u64 = arg_val(args, "--difficulty")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let miner = arg_val(args, "--miner")
+        .and_then(|v| parse_addr(&v))
+        .unwrap_or_else(|| wallet(1).address());
+    let frontier: [u8; 32] = arg_val(args, "--frontier")
+        .and_then(|v| hex_decode(&v))
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .unwrap_or([0u8; 32]);
+    let ch = turn_dag_minter::derive_challenge(epoch, &miner, &frontier);
+    println!("miner={}", hex(&miner.0));
+    println!("challenge={}", hex(&ch));
+    println!("difficulty={difficulty}");
+    println!("epoch={epoch}");
+    0
+}
+
+fn mint_verify_cmd(args: &[String]) -> i32 {
+    let epoch: u64 = arg_val(args, "--epoch")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let difficulty: u64 = arg_val(args, "--difficulty")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(16);
+    let Some(miner) = arg_val(args, "--miner").and_then(|v| parse_addr(&v)) else {
+        eprintln!("mint-verify needs --miner HEX20");
+        return 2;
+    };
+    let frontier: [u8; 32] = arg_val(args, "--frontier")
+        .and_then(|v| hex_decode(&v))
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+        .unwrap_or([0u8; 32]);
+    let Some(nonce) = arg_val(args, "--nonce").and_then(|v| v.parse::<u64>().ok()) else {
+        eprintln!("mint-verify needs --nonce N");
+        return 2;
+    };
+    let Some(hash) = arg_val(args, "--hash")
+        .and_then(|v| hex_decode(&v))
+        .and_then(|b| <[u8; 32]>::try_from(b).ok())
+    else {
+        eprintln!("mint-verify needs --hash HEX64");
+        return 2;
+    };
+    let cfg = turn_dag_minter::MinterConfig::cheap_for_tests();
+    let challenge_bytes = turn_dag_minter::derive_challenge(epoch, &miner, &frontier);
+    let challenge = turn_dag_minter::MintChallenge {
+        epoch,
+        miner,
+        dag_frontier_hash: frontier,
+        challenge: challenge_bytes,
+        issued_at: 0,
+        expires_at: u64::MAX,
+        difficulty,
+    };
+    let solution = turn_dag_minter::MintSolution {
+        challenge: challenge_bytes,
+        nonce,
+        hash,
+    };
+    match turn_dag_minter::verify_mint_once(&cfg, &challenge, &solution) {
+        Ok(()) => {
+            println!(
+                "element_id={}",
+                hex(&turn_dag_minter::mint_element_id(&challenge, &solution).0)
+            );
+            println!("mint-verify: PASS");
+            0
+        }
+        Err(e) => {
+            println!("mint-verify: FAIL {e:?}");
+            1
+        }
+    }
+}
+
+fn sig_verify_cmd(args: &[String]) -> i32 {
+    let Some(sig) = arg_val(args, "--sig").and_then(|v| hex_decode(&v)) else {
+        eprintln!("sig-verify needs --sig HEX");
+        return 2;
+    };
+    // Browser PQ wallets are passkey-derived (WebAuthn PRF), so the
+    // key is not reproducible from a seed here: verify against the
+    // presented pubkey and derive the address from it. --seed-byte
+    // remains for checking locally generated wallets.
+    if let Some(pubkey) = arg_val(args, "--pubkey").and_then(|v| hex_decode(&v)) {
+        let addr = turn_dag_wallet::PqAddress::from_pubkey(&pubkey);
+        println!("address={}", hex(&addr.0));
+        if turn_dag_wallet::HotWallet::verify(&pubkey, b"turn-dag-browser-wallet-v1", &sig) {
+            println!("sig-verify: PASS");
+            return 0;
+        }
+        println!("sig-verify: FAIL");
+        return 1;
+    }
+    let seed_byte: u8 = arg_val(args, "--seed-byte")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    let w = wallet(seed_byte);
+    println!("address={}", hex(&w.address().0));
+    if turn_dag_wallet::HotWallet::verify(w.public_key(), b"turn-dag-browser-wallet-v1", &sig) {
+        println!("sig-verify: PASS");
+        0
+    } else {
+        println!("sig-verify: FAIL");
+        1
+    }
 }
 
 fn serve_udp(args: &[String]) -> i32 {
