@@ -10,4 +10,3 @@ argon2 = "0.5"
 sha2.workspace = true
 turn-dag-element = { path = "../turn-dag-element" }
 turn-dag-wallet = { path = "../turn-dag-wallet" }
-turn-dag-dag = { path = "../turn-dag-dag" }

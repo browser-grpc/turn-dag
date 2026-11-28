@@ -202,7 +202,7 @@ pub fn solve_turn_pow(challenge: &TurnPowChallenge) -> TurnPowSolution {
 
 /// Injected confirmation check: a burn may only be redeemed after
 /// it reaches confirmation weight in the DAG (implemented by the
-/// caller over `turn-dag-dag`; tests inject a stub). Allocation on
+/// caller over the origin node ledger; tests inject a stub). Allocation on
 /// a local/unconfirmed view is rejected.
 pub trait BurnConfirmation {
     fn is_burn_confirmed(&self, burn_id: &[u8; 32]) -> bool;

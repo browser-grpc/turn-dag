@@ -1,5 +1,5 @@
 [package]
-name = "turn-dag-dag"
+name = "turn-dag-ledger"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
@@ -9,10 +9,3 @@ license.workspace = true
 sha3.workspace = true
 turn-dag-element = { path = "../turn-dag-element" }
 turn-dag-wallet = { path = "../turn-dag-wallet" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-base64 = "0.22"
-rusqlite = { version = "0.40.2", features = ["bundled"] }
-
-[dev-dependencies]
-serde_json = "1"

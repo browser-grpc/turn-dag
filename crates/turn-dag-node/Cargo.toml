@@ -8,7 +8,7 @@ license.workspace = true
 [dependencies]
 turn-dag-element = { path = "../turn-dag-element" }
 turn-dag-wallet = { path = "../turn-dag-wallet" }
-turn-dag-dag = { path = "../turn-dag-dag" }
+turn-dag-ledger = { path = "../turn-dag-ledger" }
 turn-dag-minter = { path = "../turn-dag-minter" }
 turn-dag-turn = { path = "../turn-dag-turn" }
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp", "socket-tcp"] }
@@ -17,6 +17,6 @@ getrandom = "0.4.3"
 [dev-dependencies]
 turn-dag-element = { path = "../turn-dag-element" }
 turn-dag-wallet = { path = "../turn-dag-wallet" }
-turn-dag-dag = { path = "../turn-dag-dag" }
+turn-dag-ledger = { path = "../turn-dag-ledger" }
 turn-dag-minter = { path = "../turn-dag-minter" }
 turn-dag-turn = { path = "../turn-dag-turn" }

@@ -12,7 +12,6 @@
 use argon2::{Algorithm, Argon2, Params, Version};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
-use turn_dag_dag::{Block, BlockType, ZERO_HASH};
 use turn_dag_element::ElementId;
 use turn_dag_wallet::PqAddress;
 
@@ -289,37 +288,21 @@ impl ChallengeStore {
 /// Build the mint block on the miner's own chain with work attached.
 /// The block's element is derived exactly as `turn-dag-element`
 /// prescribes: `ElementId = SHA256(challenge || nonce_be || miner)`.
-pub fn build_mint_block(
-    challenge: &MintChallenge,
-    solution: &MintSolution,
-    previous: [u8; 32],
-    link_parent: [u8; 32],
-) -> (Block, ElementId) {
-    let element_id = ElementId::derive(&challenge.challenge, solution.nonce, &challenge.miner);
-    let mut work = Vec::with_capacity(40);
-    work.extend_from_slice(&solution.nonce.to_be_bytes());
-    work.extend_from_slice(&solution.hash);
-    let mut block = Block::new(
-        BlockType::Mint,
-        challenge.miner,
-        previous,
-        link_parent,
-        element_id,
-        challenge.miner,
-    );
-    block.epoch = challenge.epoch;
-    block.work = Some(work);
-    block.issued_at = challenge.issued_at;
-    (block, element_id)
+/// Derive the element id a solved challenge mints (the ledger
+/// records it serially at the origin node; there is no mint block).
+pub fn mint_element_id(challenge: &MintChallenge, solution: &MintSolution) -> ElementId {
+    ElementId::derive(&challenge.challenge, solution.nonce, &challenge.miner)
 }
 
-pub const ZERO_FRONTIER: [u8; 32] = ZERO_HASH;
+pub const ZERO_FRONTIER: [u8; 32] = [0u8; 32];
 
 // ---------------- Economics ----------------
 
-/// Economic parameters for the slash-vs-gain assertion. All values
-/// are parameters so the test asserts a numerical relationship, not
-/// a hardcoded conclusion.
+/// Economic parameters for the forgery-cost assertion. With a
+/// per-node serial ledger a double spend is rejected atomically, so
+/// the relevant ratio is re-mint (forgery) cost vs one relay pass's
+/// value. All values are parameters so the test asserts a numerical
+/// relationship, not a hardcoded conclusion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct EconomicsConfig {
     /// Bytes per rendezvous per direction: 16_384 B/s * 120 s.
@@ -330,8 +313,9 @@ pub struct EconomicsConfig {
     /// Replacement (re-mint) cost of one element, nano-USD. Default
     /// $0.001 - a conservative Argon2id compute/energy estimate.
     pub element_value_nano_usd: f64,
-    /// Elements slashed on a confirmed double spend (spec: 5).
-    pub slash_elements: u64,
+    /// Elements an attacker must re-mint to replace one burned
+    /// element's value when forging supply (unit: elements).
+    pub remint_elements: u64,
 }
 
 impl Default for EconomicsConfig {
@@ -340,21 +324,21 @@ impl Default for EconomicsConfig {
             rendezvous_bytes: 16_384 * 120,
             price_nano_usd_per_gb: 10_000_000.0,
             element_value_nano_usd: 1_000_000.0,
-            slash_elements: 5,
+            remint_elements: 5,
         }
     }
 }
 
 impl EconomicsConfig {
-    /// Value of one rendezvous (= max double-spend gain), nano-USD.
+    /// Value of one relay pass (= max gain from a forged element), nano-USD.
     pub fn double_spend_gain_nano_usd(&self) -> f64 {
         (self.rendezvous_bytes as f64) * self.price_nano_usd_per_gb / 1_000_000_000.0
     }
-    /// Loss when slashed, nano-USD.
+    /// Cost to re-mint the elements a forged burn would consume, nano-USD.
     pub fn slash_loss_nano_usd(&self) -> f64 {
-        (self.slash_elements as f64) * self.element_value_nano_usd
+        (self.remint_elements as f64) * self.element_value_nano_usd
     }
-    /// slash_loss / double_spend_gain.
+    /// Re-mint cost / relay-pass value (kept name for the assertion).
     pub fn slash_to_gain_ratio(&self) -> f64 {
         self.slash_loss_nano_usd() / self.double_spend_gain_nano_usd()
     }
@@ -477,31 +461,27 @@ mod tests {
     }
 
     #[test]
-    fn mint_block_on_own_chain_with_work() {
+    fn mint_element_id_is_challenge_bound() {
         let cfg = cfg();
         let mut store = ChallengeStore::new();
         let ch = store.issue(&cfg, 5, miner(), [9u8; 32], 1, 100);
         let sol = solve_mint(&cfg, &ch).unwrap();
-        let (block, eid) = build_mint_block(&ch, &sol, ZERO_HASH, ZERO_HASH);
-        assert_eq!(block.block_type, BlockType::Mint);
-        assert_eq!(block.account, miner());
-        assert_eq!(block.to_address, miner());
-        assert_eq!(block.epoch, 5);
-        let work = block.work.expect("work attached");
-        assert_eq!(work.len(), 40);
-        assert_eq!(&work[8..], &sol.hash[..]);
+        let eid = mint_element_id(&ch, &sol);
         assert_eq!(eid, ElementId::derive(&ch.challenge, sol.nonce, &miner()));
-        assert_eq!(block.element_id, eid);
+        // A different miner solving the same challenge mints a different id.
+        let ch2 = store.issue(&cfg, 5, PqAddress([8u8; 20]), [9u8; 32], 1, 100);
+        let sol2 = solve_mint(&cfg, &ch2).unwrap();
+        assert_ne!(mint_element_id(&ch2, &sol2), eid);
     }
 
     #[test]
-    fn economics_slash_at_least_100x_gain() {
+    fn economics_forgery_cost_at_least_100x_gain() {
         let econ = EconomicsConfig::default();
         let gain = econ.double_spend_gain_nano_usd();
         let loss = econ.slash_loss_nano_usd();
-        // 1 rendezvous: 1_966_080 bytes at $0.01/GB ~ $0.0000197.
+        // 1 relay pass: 1_966_080 bytes at $0.01/GB ~ $0.0000197.
         assert!((gain - 19_660.8).abs() < 1.0, "gain={gain}");
-        assert_eq!(econ.slash_elements, 5);
+        assert_eq!(econ.remint_elements, 5);
         assert_eq!(loss, 5.0 * econ.element_value_nano_usd);
         let ratio = econ.slash_to_gain_ratio();
         assert!(ratio >= 100.0, "slash/gain ratio {ratio} must be >= 100");

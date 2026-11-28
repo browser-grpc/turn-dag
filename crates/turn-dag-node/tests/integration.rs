@@ -1,12 +1,10 @@
-//! Workspace-level end-to-end tests (TODO section 8):
-//! Examples A/B/C across >=3 mutually distrusting in-process nodes,
-//! a double-spend race against two issuer instances, a workspace TCP
-//! audit, and CLI smoke tests. Each node keeps its own Dag view and
-//! verifies every gossiped block independently; no sleeps.
+//! Workspace-level end-to-end tests for the per-node serial
+//! ledger design: coins bound to their originating node, atomic
+//! double-spend rejection, foreign-node non-honoring, origin-signed
+//! burn receipts feeding the relay-pass gate, a workspace TCP
+//! audit, and CLI smoke tests.
 
 use std::net::IpAddr;
-use turn_dag_dag::*;
-use turn_dag_element::ElementId;
 use turn_dag_node::*;
 use turn_dag_turn::*;
 use turn_dag_wallet::PqWallet;
@@ -15,273 +13,74 @@ fn ip(s: &str) -> IpAddr {
     s.parse().unwrap()
 }
 
-/// Broadcast a signed block to all nodes and confirm it on each.
-fn confirm_all(nodes: &mut [Node], signed: SignedBlock) -> [u8; 32] {
-    let h = signed.block_hash();
-    for n in nodes.iter_mut() {
-        n.dag.insert_block(signed.clone()).unwrap();
-        n.dag.cast_vote(n.rep, h).unwrap();
-        n.dag.confirm_step();
-        n.dag.confirm_step();
-        assert_eq!(
-            n.dag.block_status(&h),
-            Some(BlockStatus::Confirmed),
-            "node {}",
-            n.name
-        );
-    }
-    h
-}
-fn broadcast(nodes: &mut [Node], signed: &SignedBlock) {
-    for n in nodes.iter_mut() {
-        n.dag.insert_block(signed.clone()).unwrap();
-    }
-}
-/// Identically bond `owner` on every node (same signed blocks gossiped).
-fn bond_all(nodes: &mut [Node], owner: &turn_dag_wallet::HotWallet) -> [u8; 32] {
-    let addr = owner.address();
-    let mut tip = ZERO_HASH;
-    for i in 0..5u8 {
-        let mut b = [0u8; 32];
-        b[0] = addr.0[0];
-        b[1] = i + 1;
-        b[2] = 0xB0;
-        let id = ElementId(b);
-        for n in nodes.iter_mut() {
-            n.dag.register_element(id, addr);
-        }
-        let blk = Block::new(
-            BlockType::BondLock,
-            addr,
-            tip,
-            ZERO_HASH,
-            id,
-            bond_pseudo_account(&addr),
-        );
-        tip = confirm_all(nodes, sign_block(blk, owner));
-    }
-    for n in nodes.iter() {
-        assert!(n.dag.has_confirmed_bond(&addr), "{}", n.name);
-    }
-    tip
-}
-fn three_nodes() -> Vec<Node> {
-    vec![
-        Node::new("node-a", 11),
-        Node::new("node-b", 12),
-        Node::new("node-c", 13),
-    ]
-}
-fn redeem(
-    issuer: &mut TurnIssuer,
-    user: &str,
-    burn_id: [u8; 32],
-    now: u64,
-) -> ApiResponse<Vec<TurnCredential>> {
-    let client = ip("203.0.113.10");
-    let ch = issuer.handle_get_challenge(client, now).body.unwrap();
-    let challenge = TurnPowChallenge {
-        challenge_id: ch.challenge_id,
-        challenge: ch.challenge,
-        client_ip: client,
-        issued_at: now,
-        expires_at: ch.expires_at,
-        bits: ch.bits,
-    };
-    let pow = solve_turn_pow(&challenge);
-    issuer.handle_post_redeem(
-        &RedeemRequest {
-            user_id: user.into(),
-            client_ip: client,
-            peer_ip: ip("203.0.113.20"),
-            transport: Transport::Udp,
-            both_symmetric_nat: false,
-            burn_id,
-            pow,
-        },
-        now,
-    )
-}
-
 #[test]
-fn example_a_valid_transfer_across_three_nodes() {
-    let mut nodes = three_nodes();
+fn mint_transfer_burn_on_origin_ledger() {
+    let mut node = Node::new("origin-a", 11);
     let alice = wallet(1);
     let bob = wallet(2);
-    let tip = bond_all(&mut nodes, &alice);
-    let e = ElementId([42u8; 32]);
-    for n in nodes.iter_mut() {
-        n.dag.register_element(e, alice.address());
-    }
-    let send = sign_block(
-        Block::new(
-            BlockType::Send,
-            alice.address(),
-            tip,
-            ZERO_HASH,
-            e,
-            bob.address(),
-        ),
-        &alice,
-    );
-    let send_h = confirm_all(&mut nodes, send);
-    let recv = sign_block(
-        Block::new(
-            BlockType::Receive,
-            bob.address(),
-            ZERO_HASH,
-            send_h,
-            e,
-            bob.address(),
-        ),
-        &bob,
-    );
-    confirm_all(&mut nodes, recv);
-    for n in &nodes {
-        let rec = n.dag.element(&e).unwrap();
-        assert_eq!(rec.owner, bob.address(), "{}", n.name);
-        assert_eq!(rec.status, turn_dag_element::ElementStatus::Unspent);
-        assert!(n.dag.is_confirmed(&send_h));
-    }
+    let (eid, _) = node.mint_for(&alice, 1, 1_000).unwrap();
+    assert_eq!(node.balance(&alice.address()), 1);
+    assert_eq!(node.ledger.record(&eid).unwrap().origin, node.address());
+    node.transfer(eid, &alice, bob.address()).unwrap();
+    assert_eq!(node.ledger.record(&eid).unwrap().owner, bob.address());
+    let receipt = node.burn(eid, &bob).unwrap();
+    assert!(node.ledger.verify_receipt(&receipt));
+    assert!(node.ledger.verify_chain());
 }
 
 #[test]
-fn example_b_double_spend_race_two_issuers_neither_allocates_before_confirmation() {
-    let mut nodes = three_nodes();
-    let mallory = wallet(3);
-    let tip = bond_all(&mut nodes, &mallory);
-    let e = ElementId([43u8; 32]);
-    for n in nodes.iter_mut() {
-        n.dag.register_element(e, mallory.address());
-    }
-    let burn = sign_block(
-        Block::new(
-            BlockType::Burn,
-            mallory.address(),
-            tip,
-            ZERO_HASH,
-            e,
-            burn_sink(),
-        ),
-        &mallory,
+fn double_spend_is_rejected_atomically_and_foreign_node_does_not_honor() {
+    let mut a = Node::new("origin-a", 11);
+    let mut b = Node::new("origin-b", 12);
+    let alice = wallet(1);
+    let bob = wallet(2);
+    let (eid, _) = a.mint_for(&alice, 1, 1_000).unwrap();
+    // Foreign node: the coin is absent there and cannot be spent.
+    assert!(b.burn(eid, &alice).is_err());
+    assert!(b.transfer(eid, &alice, bob.address()).is_err());
+    // At the origin, the first spend wins and every second fails.
+    a.transfer(eid, &alice, bob.address()).unwrap();
+    assert!(
+        a.transfer(eid, &bob, alice.address()).is_ok(),
+        "owner transfer is the live spend path"
     );
-    let send = sign_block(
-        Block::new(
-            BlockType::Send,
-            mallory.address(),
-            tip,
-            ZERO_HASH,
-            e,
-            wallet(9).address(),
-        ),
-        &mallory,
-    );
-    let burn_h = burn.block_hash();
-    let send_h = send.block_hash();
-    broadcast(&mut nodes, &burn);
-    broadcast(&mut nodes, &send);
-    // Race: two mutually distrusting issuer instances, different DAG views.
-    // Neither allocates before confirmation.
-    for idx in [0usize, 1] {
-        let checker = DagBurnConfirmation(&nodes[idx].dag);
-        let mut issuer = TurnIssuer::new(b"issuer-secret".to_vec(), demo_policy(), &checker);
-        for bid in [burn_h, send_h] {
-            let resp = redeem(&mut issuer, "mallory", bid, 1_000);
-            assert_eq!(
-                resp.body,
-                Err(RedeemError::UnconfirmedBurn),
-                "issuer on {} pre-confirmation",
-                nodes[idx].name
-            );
-            assert_eq!(issuer.active_allocations(), 0);
-        }
-    }
-    // Burn branch wins the vote on every node; send branch is orphaned.
-    for n in nodes.iter_mut() {
-        n.dag.cast_vote(n.rep, burn_h).unwrap();
-        n.dag.confirm_step();
-        n.dag.confirm_step();
-        assert_eq!(n.dag.block_status(&burn_h), Some(BlockStatus::Confirmed));
-        assert_eq!(n.dag.block_status(&send_h), Some(BlockStatus::Orphaned));
-        assert!(
-            n.dag.get_block(&send_h).is_some(),
-            "loser retained as evidence"
-        );
-    }
-    // Winner issuer allocates exactly one credential; loser is refused.
-    {
-        let checker = DagBurnConfirmation(&nodes[0].dag);
-        let mut winner = TurnIssuer::new(b"issuer-secret".to_vec(), demo_policy(), &checker);
-        let ok = redeem(&mut winner, "mallory", burn_h, 1_100);
-        assert_eq!(ok.status, 200);
-        assert_eq!(ok.body.unwrap().len(), 1);
-        assert_eq!(winner.active_allocations(), 1);
-    }
-    {
-        let checker = DagBurnConfirmation(&nodes[1].dag);
-        let mut loser = TurnIssuer::new(b"issuer-secret".to_vec(), demo_policy(), &checker);
-        let no = redeem(&mut loser, "mallory", send_h, 1_100);
-        assert_eq!(
-            no.body,
-            Err(RedeemError::UnconfirmedBurn),
-            "orphaned loser must be refused"
-        );
-        assert_eq!(loser.active_allocations(), 0);
-    }
+    // (transfer back to Alice succeeded above; now burn and re-spend)
+    let _receipt = a.burn(eid, &alice).unwrap();
+    assert!(a.burn(eid, &alice).is_err());
+    assert!(a.transfer(eid, &alice, bob.address()).is_err());
 }
 
 #[test]
-fn example_c_slash_across_three_nodes() {
-    let mut nodes = three_nodes();
-    let mallory = wallet(3);
-    let reporter = wallet(77).address();
-    let tip = bond_all(&mut nodes, &mallory);
-    let e = ElementId([44u8; 32]);
-    for n in nodes.iter_mut() {
-        n.dag.register_element(e, mallory.address());
-    }
-    let s1 = sign_block(
-        Block::new(
-            BlockType::Burn,
-            mallory.address(),
-            tip,
-            ZERO_HASH,
-            e,
-            burn_sink(),
-        ),
-        &mallory,
-    );
-    let s2 = sign_block(
-        Block::new(
-            BlockType::Send,
-            mallory.address(),
-            tip,
-            ZERO_HASH,
-            e,
-            wallet(9).address(),
-        ),
-        &mallory,
-    );
-    broadcast(&mut nodes, &s1);
-    broadcast(&mut nodes, &s2);
-    let proof = build_fraud_proof(&s1, &s2, reporter, 1_700_000_000);
-    for n in nodes.iter_mut() {
-        let ph = n.dag.receive_proof(proof.clone()).unwrap();
-        assert!(n.dag.is_frozen(&mallory.address()), "{}", n.name);
-        assert!(n.dag.cast_slash_vote(n.rep, ph).unwrap());
-        let out = n.dag.slash_outcome(&ph).unwrap().clone();
-        assert_eq!(n.dag.element(&out.bounty_element).unwrap().owner, reporter);
-        assert_eq!(out.burned_elements.len(), 4);
-        for id in &out.burned_elements {
-            assert_eq!(
-                n.dag.element(id).unwrap().status,
-                turn_dag_element::ElementStatus::Burned
-            );
-        }
-        assert!(n.dag.is_blacklisted_addr(&mallory.address()));
-        assert!(n.dag.is_blacklisted_pubkey(mallory.public_key()));
-    }
-    let _ = tip;
+fn relay_pass_requires_origin_burn_receipt() {
+    let mut node = Node::new("origin-a", 21);
+    let alice = wallet(3);
+    let (eid, _) = node.mint_for(&alice, 1, 1_000).unwrap();
+    // Before burn: no credential.
+    let client = ip("203.0.113.10");
+    let err = issue_relay_pass(
+        &node.ledger,
+        b"issuer-secret".to_vec(),
+        [9u8; 32],
+        "alice",
+        client,
+        ip("203.0.113.20"),
+        1_000,
+    )
+    .unwrap_err();
+    assert_eq!(err, RedeemError::UnconfirmedBurn);
+    let receipt = node.burn(eid, &alice).unwrap();
+    let cred = issue_relay_pass(
+        &node.ledger,
+        b"issuer-secret".to_vec(),
+        receipt.entry_hash,
+        "alice",
+        client,
+        ip("203.0.113.20"),
+        1_100,
+    )
+    .unwrap();
+    assert_eq!(cred.expires_at, 1_220);
+    assert!(cred.username.ends_with(&cred.ticket_id));
 }
 
 #[test]
@@ -308,7 +107,7 @@ fn tcp_audit_workspace_sources_have_no_kernel_tcp() {
         }
     }
     assert!(
-        files.len() >= 6,
+        files.len() >= 5,
         "expected workspace sources, got {}",
         files.len()
     );
@@ -422,32 +221,15 @@ fn burn_gate_end_to_end_cli_ticket_to_wire() {
     use turn_dag_turn::wire::StunMessage;
     use turn_dag_turn::wire::{method, HandleOutcome, TurnServer};
     let mut node = Node::new("gate-node", 51);
-    let rep = node.rep;
     let owner = wallet(51);
-    bond(&mut node.dag, rep, &owner).unwrap();
-    let (eid, _) = mint_one(&mut node.dag, rep, &owner, 1, 1_000).unwrap();
-    let tip = node
-        .dag
-        .account_tip(&owner.address())
-        .unwrap_or(turn_dag_dag::ZERO_HASH);
-    let burn = turn_dag_dag::sign_block(
-        turn_dag_dag::Block::new(
-            turn_dag_dag::BlockType::Burn,
-            owner.address(),
-            tip,
-            turn_dag_dag::ZERO_HASH,
-            eid,
-            turn_dag_dag::burn_sink(),
-        ),
-        &owner,
-    );
-    let burn_h = burn.block_hash();
-    confirm_on(&mut node.dag, rep, burn).unwrap();
-    assert!(node.dag.is_confirmed(&burn_h));
+    let (eid, _) = node.mint_for(&owner, 1, 1_000).unwrap();
+    let receipt = node.burn(eid, &owner).unwrap();
+    let burn_h = receipt.entry_hash;
+    assert!(node.ledger.is_burned(&burn_h));
     let secret = b"gate-issuer-secret".to_vec();
     // Ticket minted ONLY after confirmation (issue_relay_pass gates on it).
     let cred = issue_relay_pass(
-        &node.dag,
+        &node.ledger,
         secret.clone(),
         burn_h,
         "gate-user",

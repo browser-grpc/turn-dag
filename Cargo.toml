@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/turn-dag-element",
     "crates/turn-dag-wallet",
-    "crates/turn-dag-dag",
+    "crates/turn-dag-ledger",
     "crates/turn-dag-minter",
     "crates/turn-dag-turn",
     "crates/turn-dag-node",

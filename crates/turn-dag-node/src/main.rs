@@ -1,11 +1,10 @@
 //! turn-dag-node CLI (std args only, no kernel TCP).
 use std::net::IpAddr;
-use turn_dag_dag::{sign_block, Block, BlockType, ZERO_HASH};
 use turn_dag_node::*;
 use turn_dag_wallet::PqWallet;
 
 const HELP: &str = "\
-turn-dag-node - DAG + minter + TURN issuer node (in-process, smoltcp virtual device, no kernel TCP)
+turn-dag-node - ledger node + minter + TURN issuer (in-process, smoltcp virtual device, no kernel TCP)
 USAGE:
   turn-dag-node [--help|help]
   turn-dag-node init
@@ -82,7 +81,7 @@ fn serve_udp(args: &[String]) -> i32 {
         server = server.with_max_allocations(q);
     }
     if let Some(hex_secret) = rest_secret {
-        let secret = turn_dag_dag::hex_decode(&hex_secret).unwrap_or_default();
+        let secret = hex_decode(&hex_secret).unwrap_or_default();
         // Issuer REST credentials (username=expiry:pow:<ticket>): the
         // long-term key derives from the issuer HMAC, as TurnIssuer
         // issues them. With --ticket, only tickets minted after a
@@ -187,7 +186,7 @@ fn serve_tls(args: &[String]) -> i32 {
     };
     let mut server = turn_dag_turn::wire::TurnServer::new(relay_ip);
     if let Some(hex_secret) = rest_secret {
-        let secret = turn_dag_dag::hex_decode(&hex_secret).unwrap_or_default();
+        let secret = hex_decode(&hex_secret).unwrap_or_default();
         server = server.with_rest_auth(secret);
         if !burn_tickets.is_empty() {
             server = server.with_burn_tickets(burn_tickets);
@@ -234,16 +233,20 @@ fn run(cmd: &str) -> i32 {
                 hex(&n.address().0),
                 n.address().to_bech32()
             );
-            println!("epoch={} tips={}", n.dag.epoch(), n.dag.tips().len());
+            println!(
+                "origin={} ledger_entries={}",
+                hex(&n.address().0),
+                n.ledger.len()
+            );
             0
         }
         "status" => {
             let n = Node::new("node-1", 1);
             println!(
-                "node status: ok address={} epoch={} online_weight={}",
+                "node status: ok address={} origin={} ledger_entries={}",
                 hex(&n.address().0),
-                n.dag.epoch(),
-                n.dag.online_weight()
+                hex(&n.ledger.origin().0),
+                n.ledger.len()
             );
             0
         }
@@ -272,19 +275,18 @@ fn run(cmd: &str) -> i32 {
 }
 
 fn flow(cmd: &str) -> i32 {
-    let mut alice = Node::new("alice-node", 1);
-    let rep = alice.rep;
+    // One origin node (relay-1) plus two user wallets. Coins are
+    // bound to relay-1's ledger: minted, transferred, and burned
+    // there serially - no bond, no voting, no DAG.
+    let mut node = Node::new("relay-1", 9);
     let alice_wallet = wallet(1);
-    if let Err(e) = bond(&mut alice.dag, rep, &alice_wallet) {
-        eprintln!("bond failed: {e}");
-        return 1;
-    }
-    println!(
-        "bond: confirmed (5 elements) has_bond={}",
-        alice.dag.has_confirmed_bond(&alice_wallet.address())
-    );
     let bob = wallet(2);
-    let (eid, mint_h) = match mint_one(&mut alice.dag, rep, &alice_wallet, 1, 1_000) {
+    println!(
+        "node: origin={} ledger_entries={}",
+        hex(&node.address().0),
+        node.ledger.len()
+    );
+    let (eid, mint_h) = match node.mint_for(&alice_wallet, 1, 1_000) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("mint failed: {e}");
@@ -292,7 +294,7 @@ fn flow(cmd: &str) -> i32 {
         }
     };
     println!(
-        "mint: element={} block={} owner={}",
+        "mint: element={} entry={} owner={}",
         hex(&eid.0),
         hex(&mint_h),
         hex(&alice_wallet.address().0)
@@ -300,97 +302,53 @@ fn flow(cmd: &str) -> i32 {
     if cmd == "mint" {
         return 0;
     }
-    let (eid_t, _) = match mint_one(&mut alice.dag, rep, &alice_wallet, 1, 1_010) {
+    let (eid_t, _) = match node.mint_for(&alice_wallet, 1, 1_010) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("mint2: {e}");
             return 1;
         }
     };
-    let (eid_b, _) = match mint_one(&mut alice.dag, rep, &alice_wallet, 1, 1_020) {
+    let (eid_b, _) = match node.mint_for(&alice_wallet, 1, 1_020) {
         Ok(v) => v,
         Err(e) => {
             eprintln!("mint3: {e}");
             return 1;
         }
     };
-    let tip = alice
-        .dag
-        .account_tip(&alice_wallet.address())
-        .unwrap_or(ZERO_HASH);
-    let send = sign_block(
-        Block::new(
-            BlockType::Send,
-            alice_wallet.address(),
-            tip,
-            ZERO_HASH,
-            eid_t,
-            bob.address(),
-        ),
-        &alice_wallet,
-    );
-    let send_h = match confirm_on(&mut alice.dag, rep, send) {
+    let send_h = match node.transfer(eid_t, &alice_wallet, bob.address()) {
         Ok(h) => h,
         Err(e) => {
-            eprintln!("send: {e}");
+            eprintln!("transfer: {e}");
             return 1;
         }
     };
-    let recv = sign_block(
-        Block::new(
-            BlockType::Receive,
-            bob.address(),
-            ZERO_HASH,
-            send_h,
-            eid_t,
-            bob.address(),
-        ),
-        &bob,
-    );
-    if let Err(e) = confirm_on(&mut alice.dag, rep, recv) {
-        eprintln!("receive: {e}");
-        return 1;
-    }
     println!(
-        "transfer: element={} send={} owner_now={}",
+        "transfer: element={} entry={} owner_now={}",
         hex(&eid_t.0),
         hex(&send_h),
-        hex(&alice
-            .dag
-            .element(&eid_t)
+        hex(&node
+            .ledger
+            .record(&eid_t)
             .map(|r| r.owner.0)
             .unwrap_or([0; 20]))
     );
     if cmd == "transfer" {
         return 0;
     }
-    let tip2 = alice
-        .dag
-        .account_tip(&alice_wallet.address())
-        .unwrap_or(ZERO_HASH);
-    let burn = sign_block(
-        Block::new(
-            BlockType::Burn,
-            alice_wallet.address(),
-            tip2,
-            ZERO_HASH,
-            eid_b,
-            turn_dag_dag::burn_sink(),
-        ),
-        &alice_wallet,
-    );
-    let burn_h = match confirm_on(&mut alice.dag, rep, burn) {
-        Ok(h) => h,
+    let receipt = match node.burn(eid_b, &alice_wallet) {
+        Ok(r) => r,
         Err(e) => {
             eprintln!("burn: {e}");
             return 1;
         }
     };
     println!(
-        "burn: element={} burn_block={} confirmed={}",
+        "burn: element={} receipt={} seq={} origin_signed={}",
         hex(&eid_b.0),
-        hex(&burn_h),
-        alice.dag.is_confirmed(&burn_h)
+        hex(&receipt.entry_hash),
+        receipt.seq,
+        receipt.verify_signature()
     );
     if cmd == "burn" {
         return 0;
@@ -404,9 +362,9 @@ fn flow(cmd: &str) -> i32 {
         .map(|d| d.as_secs())
         .unwrap_or(2_000);
     match issue_relay_pass(
-        &alice.dag,
+        &node.ledger,
         b"demo-secret".to_vec(),
-        burn_h,
+        receipt.entry_hash,
         "alice",
         client,
         peer,
@@ -418,7 +376,7 @@ fn flow(cmd: &str) -> i32 {
                 c.ticket_id, c.username, c.expires_at, c.max_bps, c.byte_cap
             );
             println!(
-                "serve-udp: pass --rest-secret <issuer-secret-hex> --ticket {} to relay for this burn (ticket is valid only because the burn was confirmed)",
+                "serve-udp: pass --rest-secret <issuer-secret-hex> --ticket {} to relay for this burn (ticket is valid only because the burn is recorded at this origin node)",
                 c.ticket_id
             );
             0
@@ -434,7 +392,7 @@ fn read_seed_file(path: &str) -> Result<[u8; 32], String> {
     let data = std::fs::read(path).map_err(|e| format!("read {path}: {e}"))?;
     let hex = String::from_utf8(data).map_err(|e| format!("seed file not UTF-8: {e}"))?;
     let hex = hex.trim();
-    let bytes = turn_dag_dag::hex_decode(hex).ok_or_else(|| "seed file is not hex".to_string())?;
+    let bytes = hex_decode(hex).ok_or_else(|| "seed file is not hex".to_string())?;
     let len = bytes.len();
     bytes
         .try_into()
@@ -544,7 +502,7 @@ fn recover(args: &[String]) -> i32 {
             return 1;
         }
     };
-    let blob = turn_dag_dag::hex_decode(hexs.trim()).unwrap_or_default();
+    let blob = hex_decode(hexs.trim()).unwrap_or_default();
     // Recovery needs the same decapsulation key (derived from the seed
     // file or stored separately); use the seed file if present, else
     // attempt with the default demo seed and report failure honestly.

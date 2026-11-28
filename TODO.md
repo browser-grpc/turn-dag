@@ -16,6 +16,28 @@ before writing code. Implementation language is **Rust**.
 - Elements cannot be subdivided. Ownership can be transferred.
   Wallet balance = count of elements owned. No amount field, no dust.
 
+## SUPERSEDED 2026-11-26 — serial per-node ledger replaces the DAG
+
+Directed by the user ("distributed dag is too complex, just use
+ledger per node, coins bound to originating node" / "do it, go"):
+
+- `turn-dag-dag` is **deleted**. In its place, `turn-dag-ledger`:
+  each node keeps one append-only, hash-chained serial log of the
+  coins it originated; it is the single writer for them, so a
+  double spend is rejected atomically (AlreadySpent) at
+  transfer/burn time. Foreign coins are absent, never honored.
+- **Bonds are removed entirely** (no BondLock/BondRelease, no
+  spend gate, no slash votes, no freeze-on-gossip): prevention at
+  the origin replaces detection-plus-punishment. Burns produce
+  origin-signed `BurnReceipt`s, verifiable offline; two conflicting
+  signed receipts are equivocation evidence.
+- Representative voting/finality, forks, fraud proofs, and the
+  spent-set CRDT are gone with the DAG crate. The fraud-proof fuzz
+  target became `ledger_receipt`. Mint PoW, PQ wallets, issuer,
+  wire protocol, TURN servers, quotas and rate limits are unchanged.
+- The spec PDF and the sections below describe the superseded
+  design and are kept as history. This section wins on conflict.
+
 ## Decisions already made — do not re-litigate without asking John
 
 - **DAG, not linear ledger.** Many untrusted participants, no central
@@ -233,7 +255,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   ChannelData stream framing in `take_frame`). Firefox turns:
   SKIPs with evidence — packet capture shows this Firefox build
   attempts `turn:?transport=tcp` but never initiates `turns:`.
-- Verified: `cargo test --workspace` (105 tests), clippy, fmt,
+- Verified: `cargo test --workspace` (87 tests after the ledger cutover), clippy, fmt,
   `docker build --target ci`, and
   `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
   (41 passed, 1 skipped — Firefox turns — 0 failed).
