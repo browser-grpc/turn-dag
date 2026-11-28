@@ -258,7 +258,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 - Verified: `cargo test --workspace` (92 tests after the ledger cutover), clippy, fmt,
   `docker build --target ci`, and
   `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
-  (64 passed, 3 skipped — Firefox + WebKit turns and fresh-context
+  (66 passed, 3 skipped — Firefox + WebKit turns and fresh-context
   passkey sync — 0 failed).
 
 ## Virtual network, rate limiting, scale, CI gate (2026-11-25)
@@ -396,7 +396,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   Suite: `tcp:dedicated-upstream-only`, `*:turn-tcp-gather`,
   `grpc:{firefox,chromium,webkit}-echo-over-turn-tcp`
   (all pass, selected pair `relay/host`).
-- Suite total is now 64 passed / 3 skipped (Firefox + WebKit
+- Suite total is now 66 passed / 3 skipped (Firefox + WebKit
   turns and fresh-context); cargo runs 153 tests including the
   vendored crates' unit tests (path deps under the workspace
   root are auto-members; their sources carry crate-level lint
@@ -426,7 +426,10 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   Chromium browser processes also run simultaneously: both
   subscribe while each takes a turn publishing to the other, and
   a Firefox publisher disconnects before Chromium replays its
-  branch history and receives a following live event.
+  branch history and receives a following live event. WebKit is
+  a third simultaneous process in the tri-instance scenario
+  (publishes to and receives from Firefox+Chromium on one topic)
+  and in a WebKit-publisher/Chromium-replay scenario.
 
 ## Decisions (settled 2026-11-25, "go all, pick as needed")
 

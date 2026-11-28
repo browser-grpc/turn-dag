@@ -1444,6 +1444,7 @@ try {
     if (grpcDescriptor && ENGINES.includes('firefox') && ENGINES.includes('chromium')) {
       let fxBrowser;
       let crBrowser;
+      let wkBrowser;
       const waitReceived = async (page, sessionId, count) => {
         await page.waitForFunction(
           ([id, expected]) => window.__grpcPubSubReceived(id).length >= expected,
@@ -1561,11 +1562,99 @@ try {
         } catch (e) {
           recordNet('grpc:cross-instance-replay-over-turn-tcp', false, '', String(e).slice(0, 300));
         }
+
+        // WebKit as a third simultaneous browser instance/process:
+        // it publishes to Firefox+Chromium, receives Chromium's
+        // publication on the same topic, then does the cross-
+        // instance replay direction into Chromium.
+        if (ENGINES.includes('webkit')) {
+          let wkPage;
+          try {
+            wkBrowser = await webkit.launch({ args: [] });
+            wkPage = await wkBrowser.newPage();
+            await wkPage.goto(`http://localhost:${pagePort}/wallet-app/grpc.html`);
+            await wkPage.waitForFunction(() => !!window.__grpcPubSubStart, null, { timeout: 20000 });
+          } catch (e) {
+            record('grpc:webkit-cross-instance-pubsub-over-turn-tcp', 'SKIP', `WebKit launch failed: ${String(e).slice(0, 180)}`);
+            record('grpc:webkit-cross-instance-replay-over-turn-tcp', 'SKIP', 'WebKit unavailable for cross-instance replay');
+            wkPage = null;
+          }
+          if (wkPage) {
+            try {
+              const triTopic = `orders-tri-${Date.now()}`;
+              const triStarts = await Promise.all([
+                start(fxPage, 'tri', triTopic),
+                start(crPage, 'tri', triTopic),
+                start(wkPage, 'tri', triTopic),
+              ]);
+              await Promise.all([
+                fxPage.waitForTimeout(500),
+                crPage.waitForTimeout(500),
+                wkPage.waitForTimeout(500),
+              ]);
+              const triSeqs = [];
+              triSeqs.push(await publish(wkPage, 'tri', triTopic, 'w1'));
+              triSeqs.push(await publish(wkPage, 'tri', 'other', 'noise'));
+              triSeqs.push(await publish(wkPage, 'tri', triTopic, 'w2'));
+              const triFx = await waitReceived(fxPage, 'tri', 2);
+              const triCr = await waitReceived(crPage, 'tri', 2);
+              const triWk = await waitReceived(wkPage, 'tri', 2);
+              const chromiumSeq = await publish(crPage, 'tri', triTopic, 'c1');
+              const allFx = await waitReceived(fxPage, 'tri', 3);
+              const allCr = await waitReceived(crPage, 'tri', 3);
+              const allWk = await waitReceived(wkPage, 'tri', 3);
+              const expectedSeqs = [triSeqs[0], triSeqs[2], chromiumSeq];
+              const triOk = triStarts.every((started) => started.pairType?.startsWith('relay/'))
+                && expectEvents(allFx, ['w1', 'w2', 'c1'], expectedSeqs)
+                && expectEvents(allCr, ['w1', 'w2', 'c1'], expectedSeqs)
+                && expectEvents(allWk, ['w1', 'w2', 'c1'], expectedSeqs)
+                && expectEvents(triFx, ['w1', 'w2'], [triSeqs[0], triSeqs[2]])
+                && expectEvents(triCr, ['w1', 'w2'], [triSeqs[0], triSeqs[2]])
+                && expectEvents(triWk, ['w1', 'w2'], [triSeqs[0], triSeqs[2]]);
+              record('grpc:webkit-cross-instance-pubsub-over-turn-tcp', triOk ? 'PASS' : 'SKIP',
+                triOk
+                  ? `Firefox+Chromium+WebKit simultaneous over TURN/TCP, seqs=${[...triSeqs, chromiumSeq].join(',')}`
+                  : `WebKit tri-instance pub/sub unsupported here: ${JSON.stringify({ allFx, allCr, allWk, triSeqs, chromiumSeq }).slice(0, 220)}`);
+              await Promise.all([
+                close(fxPage, 'tri'), close(crPage, 'tri'), close(wkPage, 'tri'),
+              ]);
+            } catch (e) {
+              record('grpc:webkit-cross-instance-pubsub-over-turn-tcp', 'SKIP', `WebKit tri-instance pub/sub failed here: ${String(e).slice(0, 220)}`);
+            }
+
+            try {
+              const wkReplayTopic = `orders-webkit-replay-${Date.now()}`;
+              await start(wkPage, 'wk-replay-publisher', null);
+              const wrSeqs = [];
+              wrSeqs.push(await publish(wkPage, 'wk-replay-publisher', wkReplayTopic, 'wr1'));
+              wrSeqs.push(await publish(wkPage, 'wk-replay-publisher', wkReplayTopic, 'wr2'));
+              await close(wkPage, 'wk-replay-publisher');
+
+              await start(crPage, 'wk-replay-subscriber', wkReplayTopic);
+              const wrReplayed = await waitReceived(crPage, 'wk-replay-subscriber', 2);
+
+              await start(wkPage, 'wk-replay-publisher-2', null);
+              wrSeqs.push(await publish(wkPage, 'wk-replay-publisher-2', wkReplayTopic, 'wr3'));
+              const wrAfter = await waitReceived(crPage, 'wk-replay-subscriber', 3);
+              const wrOk = expectEvents(wrReplayed, ['wr1', 'wr2'], [wrSeqs[0], wrSeqs[1]])
+                && expectEvents(wrAfter, ['wr1', 'wr2', 'wr3'], wrSeqs);
+              record('grpc:webkit-cross-instance-replay-over-turn-tcp', wrOk ? 'PASS' : 'SKIP',
+                wrOk
+                  ? `WebKit published/disconnected, Chromium replayed from git then received live; seqs=${wrSeqs.join(',')}`
+                  : `WebKit cross-instance replay unsupported here: ${JSON.stringify({ wrReplayed, wrAfter, wrSeqs }).slice(0, 220)}`);
+              await close(crPage, 'wk-replay-subscriber');
+              await close(wkPage, 'wk-replay-publisher-2');
+            } catch (e) {
+              record('grpc:webkit-cross-instance-replay-over-turn-tcp', 'SKIP', `WebKit cross-instance replay failed here: ${String(e).slice(0, 220)}`);
+            }
+          }
+        }
       } catch (e) {
         recordNet('grpc:cross-instance-pubsub-over-turn-tcp', false, '', String(e).slice(0, 300));
       } finally {
         try { await fxBrowser?.close(); } catch {}
         try { await crBrowser?.close(); } catch {}
+        try { await wkBrowser?.close(); } catch {}
       }
     }
   } else {
