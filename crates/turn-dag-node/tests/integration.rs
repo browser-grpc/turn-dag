@@ -134,9 +134,13 @@ fn relay_pass_requires_origin_burn_receipt() {
 
 #[test]
 fn tcp_audit_workspace_sources_have_no_kernel_tcp() {
-    // Scan every workspace src/**/*.rs, comments stripped. Test files
-    // (including this audit) are excluded: they name the patterns.
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    // Scan every workspace-crate src/**/*.rs, comments stripped.
+    // Vendored grpc-dc under /vendor is upstream code outside the
+    // workspace and is excluded: its optional TURN *client* uses
+    // kernel TCP, but our embedded rendezvous config never enables
+    // it (no turn_servers configured) - all turn-dag TCP runs over
+    // the smoltcp user-space stack. Test files are excluded too.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../crates");
     let mut files = vec![];
     let mut stack = vec![root.clone()];
     while let Some(dir) = stack.pop() {

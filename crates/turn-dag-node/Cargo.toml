@@ -13,6 +13,10 @@ turn-dag-minter = { path = "../turn-dag-minter" }
 turn-dag-turn = { path = "../turn-dag-turn" }
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "proto-ipv6", "socket-udp", "socket-tcp"] }
 getrandom = "0.4.3"
+# Embedded gRPC rendezvous server (vendored browser-grpc/grpc-over-datachannels).
+grpc-dc = { path = "../../vendor/grpc-dc/rust", features = ["webrtc"] }
+dc-webrtc = { path = "../../vendor/grpc-dc/webrtc/rust" }
+futures-util = "0.3"
 
 [dev-dependencies]
 turn-dag-element = { path = "../turn-dag-element" }

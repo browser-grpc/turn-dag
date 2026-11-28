@@ -46,9 +46,26 @@ if [ -c /dev/net/tun ] && command -v openssl >/dev/null 2>&1; then
     fi
   fi
 fi
+GRPC_PID=""
+if [ -c /dev/net/tun ]; then
+  ./target/debug/turn-dag-node serve-grpc --descriptor-out /tmp/grpc-descriptor.json \
+    --user browser-test-user --pass browser-test-secret >/tmp/grpc-server.log 2>&1 &
+  GRPC_PID=$!
+  sleep 2
+  if kill -0 "$GRPC_PID" 2>/dev/null && ip addr add 10.99.1.2/24 dev turndag1 2>/dev/null && ip link set turndag1 up 2>/dev/null && [ -f /tmp/grpc-descriptor.json ]; then
+    export TURN_TCP_URL="turn:10.99.1.1:3478?transport=tcp"
+    export GRPC_DESCRIPTOR_FILE=/tmp/grpc-descriptor.json
+    echo "grpc: embedded grpc-dc server via TURN/TCP (tun turndag1, dedicated upstream 10.99.1.2:50051)"
+  else
+    echo "grpc: serve-grpc/TUN setup failed; TURN/TCP + gRPC sub-tests will SKIP"
+    kill "$GRPC_PID" 2>/dev/null || true
+    GRPC_PID=""
+  fi
+fi
 set +e
 env TURN_HOST="$HOST" REQUIRE_RELAY=1 MIN_PASS="${MIN_PASS:-10}" BROWSERS="${BROWSERS:-firefox,chromium,webkit}" node tests/browser/run.mjs
 RC=$?
 set -e
 if [ -n "$TLS_PID" ]; then kill "$TLS_PID" 2>/dev/null || true; fi
+if [ -n "$GRPC_PID" ]; then kill "$GRPC_PID" 2>/dev/null || true; fi
 exit "$RC"

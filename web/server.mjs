@@ -27,6 +27,15 @@ const MIME = {
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   let filePath;
+  if (url.pathname.startsWith('/grpc-vendor/')) {
+    const gv = path.join(repoRoot, 'vendor/grpc-dc/js');
+    const rel = url.pathname.slice('/grpc-vendor/'.length);
+    const fp = path.join(gv, rel);
+    if (!fp.startsWith(gv) || !fs.existsSync(fp)) { res.writeHead(404); res.end('not found'); return; }
+    res.setHeader('content-type', MIME[path.extname(fp)] || 'application/octet-stream');
+    fs.createReadStream(fp).pipe(res);
+    return;
+  }
   if (url.pathname.startsWith('/vendor/')) {
     const rel = url.pathname.slice('/vendor/'.length);
     filePath = vendorRoots.map((r) => path.join(r, rel)).find((p) => fs.existsSync(p));

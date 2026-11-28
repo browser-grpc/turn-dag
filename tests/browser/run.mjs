@@ -24,6 +24,7 @@ import { firefox, chromium, webkit } from 'playwright';
 import { spawn } from 'node:child_process';
 import http from 'node:http';
 import dgram from 'node:dgram';
+import net from 'node:net';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -56,6 +57,15 @@ const MIME = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/jav
 const pageServer = http.createServer((req, res) => {
   const url = new URL(req.url, 'http://127.0.0.1');
   // Browser wallet app + its vendor modules (real app under test).
+  if (url.pathname.startsWith('/grpc-vendor/')) {
+    const gv = path.join(root, 'vendor/grpc-dc/js');
+    const rel = url.pathname.slice('/grpc-vendor/'.length);
+    const fp = path.join(gv, rel);
+    if (!fp.startsWith(gv) || !fs.existsSync(fp)) { res.writeHead(404); res.end('not found'); return; }
+    res.setHeader('content-type', MIME[path.extname(fp)] || 'application/octet-stream');
+    fs.createReadStream(fp).pipe(res);
+    return;
+  }
   if (url.pathname.startsWith('/wallet-app/') || url.pathname.startsWith('/vendor/')) {
     const isVendor = url.pathname.startsWith('/vendor/');
     const base = isVendor
@@ -228,6 +238,74 @@ class RawClient {
   }
   close() { try { this.sock.close(); } catch {} }
 }
+class TcpRawClient {
+  constructor() {
+    this.sock = null;
+    this.buffer = Buffer.alloc(0);
+    this.waiters = [];
+  }
+  connect(host, port) {
+    return new Promise((resolve, reject) => {
+      this.sock = net.connect(port, host);
+      this.sock.once('error', reject);
+      this.sock.on('data', (data) => {
+        this.buffer = Buffer.concat([this.buffer, data]);
+        this.drain();
+      });
+      this.sock.on('connect', () => {
+        this.sock.off('error', reject);
+        resolve();
+      });
+    });
+  }
+  drain() {
+    while (this.buffer.length >= 20) {
+      const len = 20 + this.buffer.readUInt16BE(2);
+      if (this.buffer.length < len) return;
+      const frame = this.buffer.subarray(0, len);
+      this.buffer = this.buffer.subarray(len);
+      this.waiters.shift()?.(frame);
+    }
+  }
+  exchange(buf, timeout = 4000) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error('tcp stun timeout')), timeout);
+      this.waiters.push((frame) => { clearTimeout(timer); resolve(frame); });
+      this.sock.write(buf);
+      this.drain();
+    });
+  }
+  async request(method, attrs, key) {
+    const txn = crypto.randomBytes(12);
+    return parseMsg(await this.exchange(buildMsg(method, attrs, key, txn)), txn);
+  }
+  async allocate(user, pass) {
+    const first = await this.request(M.ALLOCATE, [[A.REQUESTED_TRANSPORT, Buffer.from([17, 0, 0, 0])]], null);
+    if (first.cls === 'success') return { result: first, realm: first.realm || 'turn-dag', nonce: first.nonce || '' };
+    const realm = first.realm || 'turn-dag';
+    const nonce = first.nonce || '';
+    const key = crypto.createHash('md5').update(`${user}:${realm}:${pass}`).digest();
+    const result = await this.request(M.ALLOCATE, [
+      [A.REQUESTED_TRANSPORT, Buffer.from([17, 0, 0, 0])],
+      [A.USERNAME, Buffer.from(user)],
+      [A.REALM, Buffer.from(realm)],
+      [A.NONCE, Buffer.from(nonce)],
+    ], key);
+    return { result, realm, nonce };
+  }
+  async permission(peer, user, pass, auth) {
+    const key = crypto.createHash('md5').update(`${user}:${auth.realm}:${pass}`).digest();
+    const txn = crypto.randomBytes(12);
+    return parseMsg(await this.exchange(buildMsg(M.CREATE_PERMISSION, [
+      [A.XOR_PEER, xorPeer(peer, txn)],
+      [A.USERNAME, Buffer.from(user)],
+      [A.REALM, Buffer.from(auth.realm)],
+      [A.NONCE, Buffer.from(auth.nonce)],
+    ], key, txn)), txn);
+  }
+  close() { try { this.sock?.destroy(); } catch {} }
+}
+
 const credFor = (user, secretText) => crypto.createHmac('sha1', secretText).update(user).digest('base64');
 function runCli(args) {
   return new Promise((resolve, reject) => {
@@ -1246,6 +1324,94 @@ try {
     } finally {
       try { await wBrowser?.close(); } catch {}
     }
+  }
+
+  // ---------- TURN/TCP dedicated to embedded gRPC ----------
+  // scripts/browser-test.sh starts `serve-grpc`, whose TURN/TCP
+  // server is in dedicated-upstream mode: browser allocations may
+  // relay only to the embedded grpc-dc rendezvous socket. Generic
+  // external peers and allocation-to-allocation relaying must fail.
+  const turnTcpUrl = process.env.TURN_TCP_URL;
+  let grpcDescriptor = null;
+  if (process.env.GRPC_DESCRIPTOR_FILE) {
+    try { grpcDescriptor = JSON.parse(fs.readFileSync(process.env.GRPC_DESCRIPTOR_FILE, 'utf8')); } catch {}
+  }
+  if (turnTcpUrl) {
+    const tcpMatch = turnTcpUrl.match(/turns?:([^:?]+):(\d+)/);
+    const tcpCfg = {
+      iceServers: [{ urls: turnTcpUrl, username: USER, credential: PASS }],
+      iceTransportPolicy: 'relay',
+    };
+    if (tcpMatch && grpcDescriptor) {
+      const clients = [];
+      try {
+        const c1 = new TcpRawClient(); clients.push(c1);
+        await c1.connect(tcpMatch[1], Number(tcpMatch[2]));
+        const a1 = await c1.allocate(USER, PASS);
+        const c2 = new TcpRawClient(); clients.push(c2);
+        await c2.connect(tcpMatch[1], Number(tcpMatch[2]));
+        const a2 = await c2.allocate(USER, PASS);
+        const upstream = `${grpcDescriptor.host}:${grpcDescriptor.port}`;
+        const up = await c1.permission(upstream, USER, PASS, a1);
+        const ext = await c1.permission('8.8.8.8:53', USER, PASS, a1);
+        const p2p = await c1.permission(a2.result.relayed, USER, PASS, a1);
+        record('tcp:dedicated-upstream-only',
+          a1.result.cls === 'success' && up.cls === 'success' && ext.errorCode === 403 && p2p.errorCode === 403
+            ? 'PASS' : (REQUIRE ? 'FAIL' : 'SKIP'),
+          `allocate=${a1.result.cls} upstream=${up.cls}/${up.errorCode} external=${ext.errorCode} peer-to-peer=${p2p.errorCode}`);
+      } catch (e) {
+        record('tcp:dedicated-upstream-only', REQUIRE ? 'FAIL' : 'SKIP', String(e).slice(0, 250));
+      } finally {
+        clients.forEach((c) => c.close());
+      }
+    } else {
+      record('tcp:dedicated-upstream-only', 'SKIP', 'missing TURN_TCP_URL host/port or gRPC descriptor');
+    }
+
+    for (const name of ENGINES) {
+      const launcher = launchers[name];
+      if (!launcher) continue;
+      let b;
+      try {
+        b = await launcher.launch({ args: name === 'webkit' ? [] : ['--no-sandbox'] });
+        const pg = await b.newPage();
+        await pg.goto(pageUrl);
+        const gathered = await gatherOnce(pg, tcpCfg, GATHER_TIMEOUT_MS);
+        const relay = gathered.cands.filter((c) => c.includes('typ relay'));
+        if (name === 'webkit' && relay.length === 0) {
+          record('webkit:turn-tcp-gather', 'SKIP', `WebKit TURN/TCP unsupported here: state=${gathered.state} errs=${gathered.errors.join(';')}`.slice(0, 250));
+        } else {
+          recordNet(`${name}:turn-tcp-gather`, relay.length > 0,
+            `${relay.length} relay candidate(s) over ${turnTcpUrl}`,
+            `state=${gathered.state} relay=${relay.length} errors=${gathered.errors.join(';')}`);
+        }
+        if (grpcDescriptor) {
+          await pg.goto(`http://localhost:${pagePort}/wallet-app/grpc.html`);
+          await pg.waitForFunction(() => !!window.__grpcEcho, null, { timeout: 20000 });
+          const call = pg.evaluate(async ({ d, t, u, p }) => window.__grpcEcho(d, t, u, p, 'hello-turn-tcp'),
+            { d: grpcDescriptor, t: turnTcpUrl, u: USER, p: PASS });
+          const result = await Promise.race([
+            call,
+            new Promise((_, reject) => setTimeout(() => reject(new Error('grpc echo timeout')), 35000)),
+          ]).catch((e) => ({ error: String(e).slice(0, 250) }));
+          const ok = result?.message === 'echo: hello-turn-tcp' && result?.pairType?.startsWith('relay/');
+          if (name === 'webkit' && !ok) {
+            record('grpc:webkit-echo-over-turn-tcp', 'SKIP', `WebKit gRPC over TURN/TCP unsupported here: ${JSON.stringify(result).slice(0, 220)}`);
+          } else {
+            recordNet(`grpc:${name}-echo-over-turn-tcp`, !!ok,
+              `Echo over TURN/TCP only, pair=${result?.pairType}`,
+              JSON.stringify(result).slice(0, 250));
+          }
+        }
+      } catch (e) {
+        if (name === 'webkit') record('webkit:turn-tcp-gather', 'SKIP', `launch/gather failed: ${String(e).slice(0, 180)}`);
+        else recordNet(`${name}:turn-tcp-gather`, false, '', String(e).slice(0, 250));
+      } finally {
+        try { await b?.close(); } catch {}
+      }
+    }
+  } else {
+    record('tcp:turn-tcp', 'SKIP', 'no TURN_TCP_URL (needs TUN-backed serve-grpc)');
   }
 
   // ---------- turns: (TLS 5349) ----------

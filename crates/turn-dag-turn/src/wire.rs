@@ -334,7 +334,20 @@ struct Allocation {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum HandleOutcome {
     Response(Vec<u8>),
-    Forward { peer: SocketAddr, data: Vec<u8> },
+    /// Client-facing framed bytes (Data indication / ChannelData)
+    /// to send to a connected TURN client at `peer`.
+    Forward {
+        peer: SocketAddr,
+        data: Vec<u8>,
+    },
+    /// Raw payload to send to an external (non-client) `peer`
+    /// from the allocation's relayed socket. The live layer owns
+    /// per-allocation relay sockets for this egress.
+    ForwardExternal {
+        relayed: SocketAddr,
+        peer: SocketAddr,
+        payload: Vec<u8>,
+    },
     Drop,
 }
 
@@ -384,6 +397,15 @@ pub struct TurnServer {
     max_allocations: usize,
     /// `max-bps` per allocation in bytes/sec (spec: 16384; 0 = off).
     max_bps: u64,
+    /// Operator-allowlisted peer IPs (e.g. an embedded gRPC service
+    /// on a private TUN address) exempt from the denied-peer SSRF
+    /// rules. Everything else private stays denied.
+    allowed_peers: std::collections::HashSet<IpAddr>,
+    /// Dedicated upstream mode: when set, this exact socket address
+    /// is the only external peer relay traffic may reach or receive
+    /// traffic from. In particular, allocation-to-allocation relaying
+    /// is disabled.
+    dedicated_upstream: Option<SocketAddr>,
 }
 impl TurnServer {
     pub fn new(server_ip: IpAddr) -> Self {
@@ -400,6 +422,8 @@ impl TurnServer {
             nonce: String::new(),
             max_allocations: 200,
             max_bps: 16_384,
+            allowed_peers: Default::default(),
+            dedicated_upstream: None,
         }
     }
     /// Override `total-quota` (default 200, spec coturn tuning).
@@ -412,6 +436,43 @@ impl TurnServer {
     pub fn with_max_bps(mut self, bps: u64) -> Self {
         self.max_bps = bps;
         self
+    }
+    /// Allowlist peer IPs exempt from denied-peer rules (operator's
+    /// own internal services, e.g. an embedded gRPC listener).
+    pub fn with_allowed_peers(mut self, peers: Vec<IpAddr>) -> Self {
+        self.allowed_peers = peers.into_iter().collect();
+        self
+    }
+
+    /// Restrict this relay to one dedicated upstream socket address,
+    /// such as the embedded grpc-dc rendezvous listener. This also
+    /// allowlists the upstream IP. Peer-to-peer relaying between
+    /// allocations and relaying to every other external address are
+    /// disabled while this is set.
+    pub fn with_dedicated_upstream(mut self, upstream: SocketAddr) -> Self {
+        self.allowed_peers.insert(upstream.ip());
+        self.dedicated_upstream = Some(upstream);
+        self
+    }
+
+    /// The sole permitted external relay peer, when dedicated mode is on.
+    pub fn dedicated_upstream(&self) -> Option<SocketAddr> {
+        self.dedicated_upstream
+    }
+
+    fn peer_denied(&self, ip: IpAddr) -> bool {
+        is_denied_peer_ip(ip) && !self.allowed_peers.contains(&ip)
+    }
+
+    fn relay_peer_denied(&self, peer: SocketAddr) -> bool {
+        match self.dedicated_upstream {
+            Some(upstream) => peer != upstream,
+            None => self.peer_denied(peer.ip()) && !self.is_internal_relayed(peer),
+        }
+    }
+    /// Relayed address currently allocated to `client`, if any.
+    pub fn has_allocation_for_relayed(&self, relayed: SocketAddr) -> bool {
+        self.allocations.values().any(|a| a.relayed == relayed)
     }
     /// Verify issuer-issued REST credentials (username=expiry:pow:<ticket>,
     /// HMAC-SHA1 password) instead of static long-term credentials.
@@ -708,7 +769,7 @@ impl TurnServer {
         let Some(peer) = self.peer_of(msg) else {
             return self.respond(err_response(msg, 400, "Bad Request"), msg);
         };
-        if is_denied_peer_ip(peer.ip()) && !self.is_internal_relayed(peer) {
+        if self.relay_peer_denied(peer) {
             return self.respond(err_response(msg, 403, "Forbidden"), msg);
         }
         match self.allocations.get_mut(&src) {
@@ -733,7 +794,7 @@ impl TurnServer {
         if !(0x4000..=0xFFFE).contains(&chan) {
             return self.respond(err_response(msg, 400, "Bad channel"), msg);
         }
-        if is_denied_peer_ip(peer.ip()) && !self.is_internal_relayed(peer) {
+        if self.relay_peer_denied(peer) {
             return self.respond(err_response(msg, 403, "Forbidden"), msg);
         }
         match self.allocations.get_mut(&src) {
@@ -769,6 +830,12 @@ impl TurnServer {
         let Some(sender) = self.allocations.get(&src).cloned() else {
             return HandleOutcome::Drop;
         };
+        if self
+            .dedicated_upstream
+            .is_some_and(|upstream| peer != upstream)
+        {
+            return HandleOutcome::Drop;
+        }
         // max-bps token bucket (1s burst): refill, then charge.
         if self.max_bps > 0 {
             let elapsed = now.saturating_sub(sender.last_refill);
@@ -792,7 +859,7 @@ impl TurnServer {
             if !has_chan && !sender.permissions.contains(&peer.ip()) {
                 return HandleOutcome::Drop;
             }
-        } else if is_denied_peer_ip(peer.ip()) {
+        } else if self.peer_denied(peer.ip()) {
             return HandleOutcome::Drop;
         }
         // Recipient allocation (internal relay)?
@@ -837,19 +904,77 @@ impl TurnServer {
                 }
             };
         }
-        // External peer.
+        // External peer: the live layer sends the raw payload from
+        // the allocation's relayed socket (a real WebRTC peer
+        // expects bare STUN/DTLS, not a TURN Data indication).
         if sender.bytes + payload.len() as u64 > self.byte_cap {
             return HandleOutcome::Drop;
         }
         if let Some(a) = self.allocations.get_mut(&src) {
             a.bytes += payload.len() as u64;
         }
-        let mut d = StunMessage::new(method::DATA, Class::Indication, txn);
-        d.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(src, &txn));
-        d.push_attr(attr_type::DATA, payload.to_vec());
-        HandleOutcome::Forward {
+        HandleOutcome::ForwardExternal {
+            relayed: sender.relayed,
             peer,
-            data: d.encode(),
+            payload: payload.to_vec(),
+        }
+    }
+    /// Ingress from an external peer arriving on an allocation's
+    /// relayed socket. Wraps the raw payload for the owning client
+    /// (ChannelData when a channel is bound, else Data indication)
+    /// after permission and byte-cap checks.
+    pub fn handle_relayed_datagram(
+        &mut self,
+        relayed: SocketAddr,
+        peer: SocketAddr,
+        payload: &[u8],
+        now: u64,
+    ) -> HandleOutcome {
+        if self
+            .dedicated_upstream
+            .is_some_and(|upstream| peer != upstream)
+        {
+            return HandleOutcome::Drop;
+        }
+        self.allocations.retain(|_, a| a.expires_at > now);
+        let Some((client, alloc)) = self
+            .allocations
+            .iter()
+            .find(|(_, a)| a.relayed == relayed)
+            .map(|(c, a)| (*c, a.clone()))
+        else {
+            return HandleOutcome::Drop;
+        };
+        let has_chan = alloc.channels.values().any(|p| *p == peer);
+        if !has_chan && !alloc.permissions.contains(&peer.ip()) {
+            return HandleOutcome::Drop;
+        }
+        if alloc.bytes + payload.len() as u64 > self.byte_cap {
+            return HandleOutcome::Drop;
+        }
+        if let Some(a) = self.allocations.get_mut(&client) {
+            a.bytes += payload.len() as u64;
+        }
+        let back = alloc
+            .channels
+            .iter()
+            .find(|(_, p)| **p == peer)
+            .map(|(c, _)| *c);
+        match back {
+            Some(chan) => HandleOutcome::Forward {
+                peer: client,
+                data: encode_channel_data(chan, payload),
+            },
+            None => {
+                let txn = [0u8; 12];
+                let mut d = StunMessage::new(method::DATA, Class::Indication, txn);
+                d.push_attr(attr_type::XOR_PEER_ADDRESS, xor_addr(peer, &txn));
+                d.push_attr(attr_type::DATA, payload.to_vec());
+                HandleOutcome::Forward {
+                    peer: client,
+                    data: d.encode(),
+                }
+            }
         }
     }
     fn on_channel_data(&mut self, data: &[u8], src: SocketAddr, now: u64) -> HandleOutcome {
@@ -1074,14 +1199,148 @@ mod tests {
         perm.push_attr(attr_type::XOR_PEER_ADDRESS, peer_attr("8.8.8.8:53"));
         decode_ok(s.handle(&perm.encode(), client(), 1));
         match s.handle(&send.encode(), client(), 2) {
-            HandleOutcome::Forward { peer, data } => {
+            HandleOutcome::ForwardExternal {
+                relayed,
+                peer,
+                payload,
+            } => {
                 assert_eq!(peer, "8.8.8.8:53".parse::<SocketAddr>().unwrap());
+                assert_eq!(relayed.port(), 49152);
+                assert_eq!(payload, b"ping", "external peers get the raw payload");
+            }
+            other => panic!("expected ForwardExternal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relayed_ingress_wraps_for_client_and_checks_permission() {
+        let mut s = server();
+        decode_ok(s.handle(&allocate_req(), client(), 0));
+        let relayed = s.relayed_address(&client()).unwrap();
+        let ext: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        // No permission yet: ingress is dropped.
+        assert_eq!(
+            s.handle_relayed_datagram(relayed, ext, b"pong", 1),
+            HandleOutcome::Drop
+        );
+        let mut perm = StunMessage::new(method::CREATE_PERMISSION, Class::Request, txn());
+        perm.push_attr(attr_type::XOR_PEER_ADDRESS, peer_attr("8.8.8.8:53"));
+        decode_ok(s.handle(&perm.encode(), client(), 1));
+        match s.handle_relayed_datagram(relayed, ext, b"pong", 1) {
+            HandleOutcome::Forward { peer, data } => {
+                assert_eq!(peer, client());
                 let d = StunMessage::decode(&data).unwrap();
                 assert_eq!(d.method, method::DATA);
-                assert_eq!(d.attr(attr_type::DATA), Some(b"ping".as_slice()));
+                assert_eq!(d.attr(attr_type::DATA), Some(b"pong".as_slice()));
             }
-            other => panic!("expected Forward, got {other:?}"),
+            other => panic!("expected Forward to client, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn allowed_peer_exempts_embedded_service_from_denied_rules() {
+        let mut s = server();
+        decode_ok(s.handle(&allocate_req(), client(), 0));
+        let mut perm = StunMessage::new(method::CREATE_PERMISSION, Class::Request, txn());
+        perm.push_attr(attr_type::XOR_PEER_ADDRESS, peer_attr("10.99.1.2:50051"));
+        assert_eq!(
+            error_code(&decode_ok(s.handle(&perm.encode(), client(), 1))),
+            Some(403),
+            "private service address denied by default"
+        );
+        let mut s2 = server().with_allowed_peers(vec!["10.99.1.2".parse::<IpAddr>().unwrap()]);
+        decode_ok(s2.handle(&allocate_req(), client(), 0));
+        let ok = decode_ok(s2.handle(&perm.encode(), client(), 1));
+        assert_eq!(ok.class, Class::Success);
+    }
+
+    #[test]
+    fn dedicated_upstream_only_relays_embedded_service_traffic() {
+        let upstream: SocketAddr = "10.99.1.2:50051".parse().unwrap();
+        let other_client: SocketAddr = "203.0.113.8:5000".parse().unwrap();
+        let mut s = server().with_dedicated_upstream(upstream);
+        assert_eq!(s.dedicated_upstream(), Some(upstream));
+        decode_ok(s.handle(&allocate_req(), client(), 0));
+        decode_ok(s.handle(&allocate_req(), other_client, 0));
+        let relayed = s.relayed_address(&client()).unwrap();
+        let other_relayed = s.relayed_address(&other_client).unwrap();
+
+        let permission_for = |peer: &str| {
+            let mut perm = StunMessage::new(method::CREATE_PERMISSION, Class::Request, txn());
+            perm.push_attr(attr_type::XOR_PEER_ADDRESS, peer_attr(peer));
+            perm.encode()
+        };
+        let ok = decode_ok(s.handle(&permission_for("10.99.1.2:50051"), client(), 1));
+        assert_eq!(ok.class, Class::Success);
+        assert_eq!(
+            error_code(&decode_ok(s.handle(
+                &permission_for("8.8.8.8:53"),
+                client(),
+                1
+            ))),
+            Some(403),
+            "non-upstream external peers are forbidden in dedicated mode"
+        );
+        let other_relayed_s = other_relayed.to_string();
+        assert_eq!(
+            error_code(&decode_ok(s.handle(
+                &permission_for(&other_relayed_s),
+                client(),
+                1
+            ))),
+            Some(403),
+            "allocation-to-allocation relaying is disabled in dedicated mode"
+        );
+
+        let mut bind = StunMessage::new(method::CHANNEL_BIND, Class::Request, txn());
+        bind.push_attr(attr_type::CHANNEL_NUMBER, 0x4001u16.to_be_bytes().to_vec());
+        bind.push_attr(attr_type::XOR_PEER_ADDRESS, peer_attr("10.99.1.2:50051"));
+        let ok = decode_ok(s.handle(&bind.encode(), client(), 1));
+        assert_eq!(ok.class, Class::Success);
+
+        let mut bad_bind = StunMessage::new(method::CHANNEL_BIND, Class::Request, txn());
+        bad_bind.push_attr(attr_type::CHANNEL_NUMBER, 0x4002u16.to_be_bytes().to_vec());
+        bad_bind.push_attr(attr_type::XOR_PEER_ADDRESS, peer_attr(&other_relayed_s));
+        assert_eq!(
+            error_code(&decode_ok(s.handle(&bad_bind.encode(), client(), 1))),
+            Some(403)
+        );
+
+        match s.handle(&encode_channel_data(0x4001, b"grpc"), client(), 2) {
+            HandleOutcome::ForwardExternal {
+                relayed: from,
+                peer,
+                payload,
+            } => {
+                assert_eq!(from, relayed);
+                assert_eq!(peer, upstream);
+                assert_eq!(payload, b"grpc");
+            }
+            other => panic!("expected dedicated external forward, got {other:?}"),
+        }
+
+        let mut send_other = StunMessage::new(method::SEND, Class::Indication, txn());
+        send_other.push_attr(attr_type::XOR_PEER_ADDRESS, peer_attr(&other_relayed_s));
+        send_other.push_attr(attr_type::DATA, b"peer-to-peer".to_vec());
+        assert_eq!(
+            s.handle(&send_other.encode(), client(), 2),
+            HandleOutcome::Drop
+        );
+
+        match s.handle_relayed_datagram(relayed, upstream, b"reply", 2) {
+            HandleOutcome::Forward { peer, data } => {
+                assert_eq!(peer, client());
+                let (chan, payload) = decode_channel_data(&data).unwrap();
+                assert_eq!(chan, 0x4001);
+                assert_eq!(payload, b"reply");
+            }
+            other => panic!("expected upstream ingress forward, got {other:?}"),
+        }
+        let same_ip_wrong_port: SocketAddr = "10.99.1.2:9999".parse().unwrap();
+        assert_eq!(
+            s.handle_relayed_datagram(relayed, same_ip_wrong_port, b"spoof", 2),
+            HandleOutcome::Drop
+        );
     }
 
     #[test]
@@ -1463,6 +1722,7 @@ mod mutation_tests {
                     assert_eq!(m.class, Class::Error, "n={n} must not succeed");
                 }
                 HandleOutcome::Forward { .. } => panic!("truncated forward n={n}"),
+                HandleOutcome::ForwardExternal { .. } => panic!("truncated forward n={n}"),
                 HandleOutcome::Drop => {}
             }
         }

@@ -170,6 +170,35 @@ impl<D: Device> UserSpaceStack<D> {
         self.sockets.get::<udp::Socket>(self.udp_handle).is_open()
     }
 
+    /// Create an additional user-space UDP socket bound to `port`
+    /// (per-allocation relay sockets for external peers).
+    pub fn add_udp_socket(&mut self, port: u16) -> SocketHandle {
+        let rx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 65536]);
+        let tx = udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 16], vec![0u8; 65536]);
+        let mut socket = udp::Socket::new(rx, tx);
+        let _ = socket.bind(port);
+        self.sockets.add(socket)
+    }
+
+    pub fn udp_send_on(
+        &mut self,
+        handle: SocketHandle,
+        dst: IpEndpoint,
+        payload: &[u8],
+    ) -> Result<(), udp::SendError> {
+        self.sockets
+            .get_mut::<udp::Socket>(handle)
+            .send_slice(payload, dst)
+    }
+
+    pub fn udp_recv_on(&mut self, handle: SocketHandle) -> Option<(Vec<u8>, IpEndpoint)> {
+        let socket = self.sockets.get_mut::<udp::Socket>(handle);
+        match socket.recv() {
+            Ok((data, meta)) => Some((data.to_vec(), meta.endpoint)),
+            Err(_) => None,
+        }
+    }
+
     /// The TCP socket lives in the same user-space stack; listening
     /// / connecting happens over smoltcp, never the kernel.
     pub fn tcp_socket_is_user_space(&self) -> bool {

@@ -19,12 +19,18 @@ pub fn hex_bytes(b: &[u8]) -> String {
 pub struct LiveUdpTurnServer {
     socket: UdpSocket,
     server: TurnServer,
+    /// Per-allocation relay sockets for external (non-client) peers.
+    relay_sockets: std::collections::HashMap<SocketAddr, UdpSocket>,
 }
 impl LiveUdpTurnServer {
     pub fn bind(addr: SocketAddr, server: TurnServer) -> io::Result<Self> {
         let socket = UdpSocket::bind(addr)?;
         socket.set_read_timeout(Some(Duration::from_millis(250)))?;
-        Ok(Self { socket, server })
+        Ok(Self {
+            socket,
+            server,
+            relay_sockets: Default::default(),
+        })
     }
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()
@@ -39,7 +45,68 @@ impl LiveUdpTurnServer {
             .unwrap_or(0)
     }
     /// Handle one pending datagram; Ok(false) on read timeout.
+    fn relay_socket(&mut self, relayed: SocketAddr) -> io::Result<&UdpSocket> {
+        use std::collections::hash_map::Entry;
+        if let Entry::Vacant(slot) = self.relay_sockets.entry(relayed) {
+            let sock = UdpSocket::bind(relayed).or_else(|_| {
+                let any: SocketAddr = match relayed {
+                    SocketAddr::V4(_) => format!("0.0.0.0:{}", relayed.port()).parse().unwrap(),
+                    SocketAddr::V6(_) => format!("[::]:{}", relayed.port()).parse().unwrap(),
+                };
+                UdpSocket::bind(any)
+            })?;
+            sock.set_nonblocking(true)?;
+            slot.insert(sock);
+        }
+        Ok(&self.relay_sockets[&relayed])
+    }
+
+    fn drain_relay_sockets(&mut self) -> io::Result<bool> {
+        let mut worked = false;
+        let relayed_addrs: Vec<SocketAddr> = self.relay_sockets.keys().copied().collect();
+        for relayed in relayed_addrs {
+            loop {
+                let mut buf = vec![0u8; 65536];
+                let got = {
+                    let sock = &self.relay_sockets[&relayed];
+                    sock.recv_from(&mut buf)
+                };
+                match got {
+                    Ok((n, peer)) => {
+                        worked = true;
+                        let outcome = self.server.handle_relayed_datagram(
+                            relayed,
+                            peer,
+                            &buf[..n],
+                            Self::now(),
+                        );
+                        if let HandleOutcome::Forward { peer: client, data } = outcome {
+                            self.socket.send_to(&data, client)?;
+                        }
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        // Prune relay sockets whose allocation expired.
+        let dead: Vec<SocketAddr> = self
+            .relay_sockets
+            .keys()
+            .filter(|r| !self.server.has_allocation_for_relayed(**r))
+            .copied()
+            .collect();
+        for r in dead {
+            self.relay_sockets.remove(&r);
+        }
+        Ok(worked)
+    }
+
     pub fn serve_once(&mut self) -> io::Result<bool> {
+        if self.drain_relay_sockets()? {
+            // Still fall through to the control socket below (its
+            // 250ms timeout bounds relay-ingress latency).
+        }
         let mut buf = [0u8; 2048];
         let (n, src) = match self.socket.recv_from(&mut buf) {
             Ok(v) => v,
@@ -73,6 +140,13 @@ impl LiveUdpTurnServer {
                 HandleOutcome::Forward { peer, data } => {
                     eprintln!("turn-udp fwd {peer} {}B", data.len())
                 }
+                HandleOutcome::ForwardExternal {
+                    relayed,
+                    peer,
+                    payload,
+                } => {
+                    eprintln!("turn-udp fwd-ext {relayed} -> {peer} {}B", payload.len())
+                }
                 HandleOutcome::Drop => eprintln!("turn-udp drop"),
             }
         }
@@ -82,6 +156,14 @@ impl LiveUdpTurnServer {
             }
             HandleOutcome::Forward { peer, data } => {
                 self.socket.send_to(&data, peer)?;
+            }
+            HandleOutcome::ForwardExternal {
+                relayed,
+                peer,
+                payload,
+            } => {
+                let sock = self.relay_socket(relayed)?;
+                sock.send_to(&payload, peer)?;
             }
             HandleOutcome::Drop => {}
         }
@@ -173,6 +255,9 @@ pub fn serve_tls_stream<S: Read + Write>(
                         HandleOutcome::Forward { data, .. } => {
                             let _ = data;
                         }
+                        HandleOutcome::ForwardExternal { .. } => {
+                            // Single-stream helper owns no relay sockets.
+                        }
                         HandleOutcome::Drop => {}
                     }
                 }
@@ -192,7 +277,8 @@ pub fn serve_tls_stream<S: Read + Write>(
 
 struct TlsConn {
     handle: smoltcp::iface::SocketHandle,
-    tls: rustls::ServerConnection,
+    /// None = plain TURN/TCP (turn:?transport=tcp); Some = turns:.
+    tls: Option<rustls::ServerConnection>,
     plain_in: Vec<u8>,
     cipher_out: Vec<u8>,
     src: SocketAddr,
@@ -205,11 +291,14 @@ struct TlsConn {
 /// that owns the recipient allocation. No kernel TCP anywhere.
 pub struct LiveTlsTurnServer<D: Device> {
     stack: UserSpaceStack<D>,
-    config: Arc<rustls::ServerConfig>,
+    /// None serves plain TURN over TCP; Some serves turns: (TLS).
+    config: Option<Arc<rustls::ServerConfig>>,
     turn: TurnServer,
     listeners: Vec<smoltcp::iface::SocketHandle>,
     port: u16,
     conns: Vec<TlsConn>,
+    /// Per-allocation smoltcp UDP relay sockets (external peers).
+    relay_sockets: std::collections::HashMap<SocketAddr, smoltcp::iface::SocketHandle>,
     now_ms: i64,
 }
 
@@ -223,11 +312,12 @@ impl<D: Device> LiveTlsTurnServer<D> {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let mut srv = Self {
             stack,
-            config,
+            config: Some(config),
             turn,
             listeners: Vec::new(),
             port,
             conns: Vec::new(),
+            relay_sockets: Default::default(),
             now_ms: 0,
         };
         // A pool of listening sockets: one smoltcp listener captures
@@ -237,6 +327,30 @@ impl<D: Device> LiveTlsTurnServer<D> {
             srv.stack
                 .tcp_listen(h, port)
                 .map_err(|e| io::Error::other(format!("tls listen: {e:?}")))?;
+            srv.listeners.push(h);
+        }
+        Ok(srv)
+    }
+
+    /// Plain TURN over TCP (`turn:...?transport=tcp`) on the same
+    /// smoltcp/TUN stack - the TCP flavor Firefox initiates (it
+    /// never initiates turns:). No TLS wrapping of any kind.
+    pub fn new_plain(stack: UserSpaceStack<D>, turn: TurnServer, port: u16) -> io::Result<Self> {
+        let mut srv = Self {
+            stack,
+            config: None,
+            turn,
+            listeners: Vec::new(),
+            port,
+            conns: Vec::new(),
+            relay_sockets: Default::default(),
+            now_ms: 0,
+        };
+        for _ in 0..4 {
+            let h = srv.stack.add_tcp_socket();
+            srv.stack
+                .tcp_listen(h, port)
+                .map_err(|e| io::Error::other(format!("tcp listen: {e:?}")))?;
             srv.listeners.push(h);
         }
         Ok(srv)
@@ -259,6 +373,28 @@ impl<D: Device> LiveTlsTurnServer<D> {
         }
     }
 
+    fn std_to_endpoint(addr: SocketAddr) -> smoltcp::wire::IpEndpoint {
+        match addr {
+            SocketAddr::V4(v4) => smoltcp::wire::IpEndpoint::new(
+                IpAddress::Ipv4(smoltcp::wire::Ipv4Address::from(v4.ip().octets())),
+                v4.port(),
+            ),
+            SocketAddr::V6(v6) => smoltcp::wire::IpEndpoint::new(
+                IpAddress::Ipv6(smoltcp::wire::Ipv6Address::from(v6.ip().octets())),
+                v6.port(),
+            ),
+        }
+    }
+
+    fn ensure_relay_socket(&mut self, relayed: SocketAddr) -> smoltcp::iface::SocketHandle {
+        if let Some(h) = self.relay_sockets.get(&relayed) {
+            return *h;
+        }
+        let h = self.stack.add_udp_socket(relayed.port());
+        self.relay_sockets.insert(relayed, h);
+        h
+    }
+
     /// One service round: poll the stack, accept new TLS connections,
     /// pump ciphertext/plaintext both ways. Ok(false) when idle.
     pub fn serve_once(&mut self) -> io::Result<bool> {
@@ -276,32 +412,34 @@ impl<D: Device> LiveTlsTurnServer<D> {
                 continue;
             };
             let src = Self::endpoint_to_std(ep);
-            match rustls::ServerConnection::new(self.config.clone()) {
-                Ok(tls) => {
+            let tls = match &self.config {
+                Some(cfg) => match rustls::ServerConnection::new(cfg.clone()) {
+                    Ok(t) => Some(t),
+                    Err(_) => return Ok(true),
+                },
+                None => None,
+            };
+            if std::env::var_os("TURN_DEBUG").is_some() {
+                eprintln!("turn-tcp accept from {src} tls={}", tls.is_some());
+            }
+            self.conns.push(TlsConn {
+                handle,
+                tls,
+                plain_in: Vec::new(),
+                cipher_out: Vec::new(),
+                src,
+                dead: false,
+            });
+            let h = self.stack.add_tcp_socket();
+            match self.stack.tcp_listen(h, self.port) {
+                Ok(()) => {
+                    self.listeners[li] = h;
+                }
+                Err(e) => {
                     if std::env::var_os("TURN_DEBUG").is_some() {
-                        eprintln!("turn-tls accept from {src}");
-                    }
-                    self.conns.push(TlsConn {
-                        handle,
-                        tls,
-                        plain_in: Vec::new(),
-                        cipher_out: Vec::new(),
-                        src,
-                        dead: false,
-                    });
-                    let h = self.stack.add_tcp_socket();
-                    match self.stack.tcp_listen(h, self.port) {
-                        Ok(()) => {
-                            self.listeners[li] = h;
-                        }
-                        Err(e) => {
-                            if std::env::var_os("TURN_DEBUG").is_some() {
-                                eprintln!("turn-tls re-listen failed: {e:?}");
-                            }
-                        }
+                        eprintln!("turn-tcp re-listen failed: {e:?}");
                     }
                 }
-                Err(_) => return Ok(true),
             }
         }
         let mut worked = false;
@@ -311,6 +449,24 @@ impl<D: Device> LiveTlsTurnServer<D> {
         }
         // Handle complete frames (may produce cross-conn forwards).
         let mut outputs: Vec<(Option<SocketAddr>, usize, Vec<u8>)> = Vec::new();
+        let mut externals: Vec<(SocketAddr, SocketAddr, Vec<u8>)> = Vec::new();
+        // Relay-socket ingress: external peers -> owning clients.
+        {
+            let relayed_addrs: Vec<SocketAddr> = self.relay_sockets.keys().copied().collect();
+            for relayed in relayed_addrs {
+                let handle = self.relay_sockets[&relayed];
+                while let Some((data, ep)) = self.stack.udp_recv_on(handle) {
+                    let peer = Self::endpoint_to_std(ep);
+                    let outcome =
+                        self.turn
+                            .handle_relayed_datagram(relayed, peer, &data, now_secs());
+                    if let HandleOutcome::Forward { peer: client, data } = outcome {
+                        outputs.push((Some(client), 0, data));
+                        worked = true;
+                    }
+                }
+            }
+        }
         for idx in 0..self.conns.len() {
             let src = self.conns[idx].src;
             while let Some(frame) = take_frame(&mut self.conns[idx].plain_in) {
@@ -325,11 +481,16 @@ impl<D: Device> LiveTlsTurnServer<D> {
                             )
                         })
                         .unwrap_or_else(|| format!("channeldata/other len={}", frame.len()));
-                    eprintln!("turn-tls frame from {src}: {desc}");
+                    eprintln!("turn-tcp frame from {src}: {desc}");
                 }
                 match self.turn.handle(&frame, src, now_secs()) {
                     HandleOutcome::Response(bytes) => outputs.push((None, idx, bytes)),
                     HandleOutcome::Forward { peer, data } => outputs.push((Some(peer), idx, data)),
+                    HandleOutcome::ForwardExternal {
+                        relayed,
+                        peer,
+                        payload,
+                    } => externals.push((relayed, peer, payload)),
                     HandleOutcome::Drop => {}
                 }
                 worked = true;
@@ -341,17 +502,31 @@ impl<D: Device> LiveTlsTurnServer<D> {
                 Some(peer) => self.conns.iter().position(|c| c.src == peer),
             };
             if let Some(d) = dest {
-                use std::io::Write as _;
-                let _ = self.conns[d].tls.writer().write(&bytes);
+                match &mut self.conns[d].tls {
+                    Some(tls) => {
+                        use std::io::Write as _;
+                        let _ = tls.writer().write(&bytes);
+                    }
+                    None => self.conns[d].cipher_out.extend_from_slice(&bytes),
+                }
             }
+        }
+        for (relayed, peer, payload) in externals {
+            let handle = self.ensure_relay_socket(relayed);
+            let _ = self
+                .stack
+                .udp_send_on(handle, Self::std_to_endpoint(peer), &payload);
+            worked = true;
         }
         // Flush TLS ciphertext toward the sockets.
         for idx in 0..self.conns.len() {
             let conn = &mut self.conns[idx];
-            let mut sink: Vec<u8> = Vec::new();
-            if conn.tls.wants_write() {
-                let _ = conn.tls.write_tls(&mut sink);
-                conn.cipher_out.extend_from_slice(&sink);
+            if let Some(tls) = &mut conn.tls {
+                let mut sink: Vec<u8> = Vec::new();
+                if tls.wants_write() {
+                    let _ = tls.write_tls(&mut sink);
+                    conn.cipher_out.extend_from_slice(&sink);
+                }
             }
             if !conn.cipher_out.is_empty() {
                 if let Ok(n) = self.stack.tcp_send(conn.handle, &conn.cipher_out.clone()) {
@@ -377,6 +552,20 @@ impl<D: Device> LiveTlsTurnServer<D> {
                 i += 1;
             }
         }
+        // Prune relay sockets whose allocation has expired.
+        {
+            let dead: Vec<SocketAddr> = self
+                .relay_sockets
+                .keys()
+                .filter(|r| !self.turn.has_allocation_for_relayed(**r))
+                .copied()
+                .collect();
+            for r in dead {
+                if let Some(h) = self.relay_sockets.remove(&r) {
+                    self.stack.remove_socket(h);
+                }
+            }
+        }
         Ok(worked)
     }
 
@@ -396,15 +585,20 @@ impl<D: Device> LiveTlsTurnServer<D> {
                 break;
             }
             worked = true;
+            if self.conns[idx].tls.is_none() {
+                // Plain TURN/TCP: socket bytes are already frames.
+                self.conns[idx].plain_in.extend_from_slice(&chunk[..n]);
+                continue;
+            }
             let mut cursor = io::Cursor::new(chunk[..n].to_vec());
-            match self.conns[idx].tls.read_tls(&mut cursor) {
+            match self.conns[idx].tls.as_mut().unwrap().read_tls(&mut cursor) {
                 Ok(_) => {}
                 Err(_) => {
                     self.conns[idx].dead = true;
                     break;
                 }
             }
-            match self.conns[idx].tls.process_new_packets() {
+            match self.conns[idx].tls.as_mut().unwrap().process_new_packets() {
                 Ok(_) => {}
                 Err(e) => {
                     if std::env::var_os("TURN_DEBUG").is_some() {
@@ -417,7 +611,13 @@ impl<D: Device> LiveTlsTurnServer<D> {
             // Plaintext out of rustls.
             loop {
                 let mut plain = [0u8; 4096];
-                match self.conns[idx].tls.reader().read(&mut plain) {
+                match self.conns[idx]
+                    .tls
+                    .as_mut()
+                    .unwrap()
+                    .reader()
+                    .read(&mut plain)
+                {
                     Ok(0) => break,
                     Ok(m) => {
                         self.conns[idx].plain_in.extend_from_slice(&plain[..m]);
@@ -457,7 +657,24 @@ impl LiveTlsTurnServer<crate::tun::FdDevice<std::fs::File>> {
         let stack = UserSpaceStack::new_with_device(device, ip, prefix_len, crate::TURN_PORT);
         Self::new(stack, config, turn, port)
     }
+
+    /// Plain TURN/TCP on a TUN device (see `bind_tun` operator note).
+    pub fn bind_tun_plain(
+        tun_name: &str,
+        ip: IpAddress,
+        prefix_len: u8,
+        turn: TurnServer,
+        port: u16,
+    ) -> io::Result<Self> {
+        let file = crate::tun::open_tun(tun_name)?;
+        let device = crate::tun::FdDevice::new(file, 1500);
+        let stack = UserSpaceStack::new_with_device(device, ip, prefix_len, crate::TURN_PORT);
+        Self::new_plain(stack, turn, port)
+    }
 }
+
+/// Plain TURN/TCP and turns: share one implementation.
+pub type LiveTcpTurnServer<D> = LiveTlsTurnServer<D>;
 
 #[cfg(test)]
 mod tests {
@@ -624,6 +841,29 @@ mod tests {
             .filter(|p| p.len() > 33 && p[9] == 6 && (p[33] & 0x12) == 0x12)
             .count();
         assert_eq!(synacks, 2, "both simultaneous SYNs answered");
+    }
+
+    #[test]
+    fn plain_tcp_server_syn_gets_synack_over_virtual_device() {
+        // Plain TURN/TCP shares the listener-pool stack: a SYN must
+        // be answered exactly as in TLS mode, minus the handshake.
+        let stack = UserSpaceStack::new(IpAddress::v4(10, 99, 0, 1), 24, crate::TURN_PORT);
+        let turn = TurnServer::new("10.99.0.1".parse::<IpAddr>().unwrap());
+        let mut srv = LiveTlsTurnServer::new_plain(stack, turn, 3478).unwrap();
+        srv.stack.device.inject(craft_tcp(
+            [10, 99, 0, 2],
+            [10, 99, 0, 1],
+            40000,
+            3478,
+            100,
+            &[],
+        ));
+        srv.serve_once().unwrap();
+        assert!(!srv.stack.device.tx_queue.is_empty());
+        let reply = srv.stack.device.tx_queue.front().unwrap().clone();
+        assert_eq!(reply[9], 6);
+        assert_eq!(reply[33] & 0x12, 0x12, "SYN-ACK flags");
+        assert_eq!(u16::from_be_bytes([reply[20], reply[21]]), 3478);
     }
 
     #[test]

@@ -367,6 +367,41 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   The keeper is the session-layer primitive; wiring it into the
   wire server's renewal path is the follow-on step.
 
+## Everything over TURN/TCP + embedded grpc-dc (2026-11-26)
+
+- **Plain TURN/TCP server** (`serve-tcp`, turn:?transport=tcp)
+  on the same smoltcp/TUN stack as turns: - the TCP flavor
+  Firefox actually initiates. All three engines gather relay
+  candidates and complete gRPC over it.
+- **Real external relaying**: the wire server unwraps client
+  payloads to raw bytes for external peers (`ForwardExternal`)
+  and wraps relay-socket ingress back to clients
+  (`handle_relayed_datagram`); live servers own per-allocation
+  relay sockets (smoltcp UDP on TUN for TCP/TLS, kernel UDP for
+  serve-udp). Before this, only allocation↔allocation relaying
+  existed - an external WebRTC peer was unreachable.
+- **Dedicated-upstream mode**: `TurnServer::with_dedicated_upstream`
+  restricts relaying to exactly one socket address - in
+  `serve-grpc` that is the embedded grpc-dc rendezvous listener.
+  Non-upstream permissions/channel-binds get 403; sends and
+  ingress from any other peer (including peer-to-peer between
+  allocations, and the upstream IP at the wrong port) drop.
+- **Embedded grpc-dc server**: grpc-dc runtime + dc-webrtc +
+  Echo are vendored (browser-grpc @ fdd4374e, ~1MB, examples and
+  dev-deps stripped) and `turn-dag-node serve-grpc` runs the
+  rendezvous Echo service in-process next to its dedicated
+  TURN/TCP server. Browsers dial it with `rendezvousChannel`
+  restricted to `iceTransportPolicy: "relay"` over
+  `turn:...?transport=tcp` - every packet traverses TURN/TCP.
+  Suite: `tcp:dedicated-upstream-only`, `*:turn-tcp-gather`,
+  `grpc:{firefox,chromium,webkit}-echo-over-turn-tcp`
+  (all pass, selected pair `relay/host`).
+- Suite total is now 59 passed / 3 skipped (Firefox + WebKit
+  turns and fresh-context); cargo runs 151 tests including the
+  vendored crates' unit tests (path deps under the workspace
+  root are auto-members; their sources carry crate-level lint
+  allowances since upstream's clippy baseline differs).
+
 ## Decisions (settled 2026-11-25, "go all, pick as needed")
 
 - Mint issuance: **10,000/epoch stands** (configurable via

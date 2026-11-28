@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>turn-dag gRPC over TURN/TCP</title>
+</head>
+<body>
+<h1>gRPC (grpc-dc rendezvous) over TURN/TCP</h1>
+<p>The embedded grpc-dc Echo server is dialed with
+<code>rendezvousChannel</code> restricted to a TURN relay
+(<code>iceTransportPolicy: "relay"</code> over
+<code>turn:...?transport=tcp</code>): every packet between this
+browser and the gRPC server traverses the TURN/TCP relay.</p>
+<pre id="out">idle</pre>
+<script type="module" src="./grpc-app.js"></script>
+</body>
+</html>
