@@ -6,6 +6,8 @@ import { rendezvousChannel } from '/grpc-vendor/src/rendezvous.js';
 import { EchoRequest } from '/grpc-vendor/examples/echo_pb.js';
 import { EchoClient } from '/grpc-vendor/examples/echo_grpc_dc.js';
 import { EventBusClient, publishEvent, subscribeEvents, tagString } from '/grpc-vendor/src/eventbus.js';
+import { registerPasskey, unlockWalletWithPasskey, deriveKeysFromSeed, hexToBytes } from './wallet.js';
+import { createEphemeralSigner, signEventEnvelope, decodeSignedEventPayload } from './signed-pubsub.js';
 import { Tag } from '/grpc-vendor/src/events_pb.js';
 
 async function pairType(pc) {
@@ -29,6 +31,60 @@ async function dial(descriptor, turnUrl, username, credential) {
     timeoutMs: 20000,
   });
 }
+
+// The persistent wallet key that certifies ephemeral publishing
+// keys. In production it comes from WebAuthn PRF unlock; the demo
+// seed path exists for engines without a test passkey authenticator.
+let signingWallet = null;
+function requireSigner() {
+  if (!signingWallet) throw new Error('unlock the signing wallet before publishing');
+  return createEphemeralSigner(signingWallet);
+}
+async function signedPublish(session, tags, payload) {
+  const envelope = signEventEnvelope(session.signer, tags, payload);
+  return publishEvent(
+    session.client,
+    tags,
+    envelope,
+    session.signer.wallet.addressHex,
+  );
+}
+function unwrapEvent(event) {
+  const decoded = decodeSignedEventPayload(event.payload);
+  return {
+    payload: new TextDecoder().decode(decoded.payload),
+    seq: Number(event.seq),
+    clientSeq: decoded.clientSeq,
+    walletAddress: decoded.walletAddress,
+  };
+}
+
+window.__grpcUseDemoWallet = (seedHex) => {
+  signingWallet = deriveKeysFromSeed(hexToBytes(seedHex));
+  signingWallet.seedSource = 'demo-seed-test-only';
+  return signingWallet.addressHex;
+};
+window.__grpcUnlockSigner = async () => {
+  // Register only when this origin has no stored credential id;
+  // a second registration would create a different passkey and
+  // therefore a different wallet.
+  if (!localStorage.getItem('turndag-passkey-credential-id')) {
+    await registerPasskey();
+  }
+  signingWallet = await unlockWalletWithPasskey();
+  const el = document.getElementById('signer');
+  if (el) el.textContent = `signer: webauthn-prf ${signingWallet.addressHex}`;
+  return signingWallet.addressHex;
+};
+document.getElementById('btn-grpc-unlock')?.addEventListener('click', async () => {
+  const el = document.getElementById('signer');
+  try {
+    const address = await window.__grpcUnlockSigner();
+    if (el) el.textContent = `signer: webauthn-prf ${address}`;
+  } catch (e) {
+    if (el) el.textContent = `signer unlock failed: ${e.message}`;
+  }
+});
 
 window.__grpcEcho = async (descriptor, turnUrl, username, credential, message) => {
   const channel = await dial(descriptor, turnUrl, username, credential);
@@ -60,6 +116,7 @@ window.__grpcPubSubStart = async (
   const session = {
     channel,
     client: new EventBusClient(channel),
+    signer: requireSigner(),
     received: [],
     iterator: null,
     error: null,
@@ -74,10 +131,7 @@ window.__grpcPubSubStart = async (
         for (;;) {
           const step = await session.iterator.next();
           if (step.done) return;
-          session.received.push({
-            payload: new TextDecoder().decode(step.value.payload),
-            seq: Number(step.value.seq),
-          });
+          session.received.push(unwrapEvent(step.value));
         }
       } catch (e) {
         session.error = String(e);
@@ -90,11 +144,10 @@ window.__grpcPubSubStart = async (
 window.__grpcPubSubPublish = async (sessionId, topic, payload) => {
   const session = pubSubSessions.get(sessionId);
   if (!session) throw new Error(`unknown pub/sub session ${sessionId}`);
-  const seq = await publishEvent(
-    session.client,
+  const seq = await signedPublish(
+    session,
     [tagString(Tag.TOPIC, topic)],
     new TextEncoder().encode(payload),
-    'browser-pubsub',
   );
   return Number(seq);
 };
@@ -125,7 +178,7 @@ window.__grpcPubSub = async (descriptor, turnUrl, username, credential, topic = 
     while (out.length < count) {
       const step = await iterator.next();
       if (step.done) throw new Error('subscription ended early');
-      out.push({ payload: dec(step.value.payload), seq: Number(step.value.seq) });
+      out.push(unwrapEvent(step.value));
     }
   };
 
@@ -133,6 +186,7 @@ window.__grpcPubSub = async (descriptor, turnUrl, username, credential, topic = 
   const channel1 = await dial(descriptor, turnUrl, username, credential);
   const pair1 = await pairType(channel1.peerConnection);
   const client1 = new EventBusClient(channel1);
+  const session1 = { client: client1, signer: requireSigner() };
   const stream1 = await subscribeEvents(client1, orders);
   const it1 = stream1[Symbol.asyncIterator]();
   const live = [];
@@ -140,9 +194,9 @@ window.__grpcPubSub = async (descriptor, turnUrl, username, credential, topic = 
   // Let Subscribe register before publishing.
   await new Promise((resolve) => setTimeout(resolve, 300));
   const seqs = [];
-  seqs.push(Number(await publishEvent(client1, orders, enc('o1'), 'browser-pubsub')));
-  seqs.push(Number(await publishEvent(client1, other, enc('noise'), 'browser-pubsub')));
-  seqs.push(Number(await publishEvent(client1, orders, enc('o2'), 'browser-pubsub')));
+  seqs.push(Number(await signedPublish(session1, orders, enc('o1'))));
+  seqs.push(Number(await signedPublish(session1, other, enc('noise'))));
+  seqs.push(Number(await signedPublish(session1, orders, enc('o2'))));
   await liveDone;
   await it1.return();
   channel1.closeRendezvous();
@@ -152,11 +206,12 @@ window.__grpcPubSub = async (descriptor, turnUrl, username, credential, topic = 
   const channel2 = await dial(descriptor, turnUrl, username, credential);
   const pair2 = await pairType(channel2.peerConnection);
   const client2 = new EventBusClient(channel2);
+  const session2 = { client: client2, signer: requireSigner() };
   const stream2 = await subscribeEvents(client2, orders);
   const it2 = stream2[Symbol.asyncIterator]();
   const replayed = [];
   await collectUntil(it2, replayed, 2);
-  seqs.push(Number(await publishEvent(client2, orders, enc('o3'), 'browser-pubsub')));
+  seqs.push(Number(await signedPublish(session2, orders, enc('o3'))));
   await collectUntil(it2, replayed, 3);
   await it2.return();
   channel2.closeRendezvous();

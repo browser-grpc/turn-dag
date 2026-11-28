@@ -17,6 +17,10 @@ getrandom = "0.4.3"
 grpc-dc = { path = "../../vendor/grpc-dc/rust", features = ["webrtc"] }
 dc-webrtc = { path = "../../vendor/grpc-dc/webrtc/rust" }
 futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+ciborium = "0.2"
+serde_bytes = "0.11"
+sha2.workspace = true
 
 [dev-dependencies]
 turn-dag-element = { path = "../turn-dag-element" }

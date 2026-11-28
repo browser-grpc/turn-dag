@@ -3,9 +3,22 @@
 <head>
 <meta charset="utf-8">
 <title>turn-dag gRPC over TURN/TCP</title>
+<script type="importmap">
+{
+  "imports": {
+    "hash-wasm": "/vendor/hash-wasm/dist/index.esm.js",
+    "cbor-x": "/vendor/cbor-x/index.js",
+    "@noble/post-quantum/": "/vendor/@noble/post-quantum/",
+    "@noble/hashes/": "/vendor/@noble/hashes/",
+    "@noble/curves/": "/vendor/@noble/curves/"
+  }
+}
+</script>
 </head>
 <body>
 <h1>gRPC (grpc-dc rendezvous) over TURN/TCP</h1>
+<button id="btn-grpc-unlock">Register + unlock passkey signing wallet</button>
+<pre id="signer">signer: locked</pre>
 <p>The embedded grpc-dc Echo server is dialed with
 <code>rendezvousChannel</code> restricted to a TURN relay
 (<code>iceTransportPolicy: "relay"</code> over

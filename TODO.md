@@ -397,7 +397,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   `grpc:{firefox,chromium,webkit}-echo-over-turn-tcp`
   (all pass, selected pair `relay/host`).
 - Suite total is now 66 passed / 3 skipped (Firefox + WebKit
-  turns and fresh-context); cargo runs 153 tests including the
+  turns and fresh-context); cargo runs 154 tests including the
   vendored crates' unit tests (path deps under the workspace
   root are auto-members; their sources carry crate-level lint
   allowances since upstream's clippy baseline differs).
@@ -407,6 +407,14 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
 - The embedded grpc-dc server now also serves
   `grpcdc.events.v1.EventBus` Publish/Subscribe via
   `GitEventBusBroker` (`crates/turn-dag-node/src/git_event_bus.rs`).
+- Publishing is **signed**: the browser's WebAuthn-PRF-derived
+  ML-DSA wallet certifies a short-lived ephemeral ML-DSA keypair,
+  and the ephemeral key signs each event (CBOR envelope with the
+  cert core, hashes binding, per-ephemeral monotonic counter).
+  The broker verifies address/pubkey binding, both signatures,
+  cert validity, signed tags, and counter monotonicity before
+  the Git append; unsigned, tampered, and replayed envelopes are
+  rejected. Received events are unwrapped to their inner payload.
 - The broker uses grpc-dc's established git format: branch
   `grpc-dc-events` by default, one commit per event, authoritative
   `event.pb` blob, sequence/publisher/tag trailers. Publishing

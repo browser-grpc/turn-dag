@@ -13,14 +13,211 @@ use grpc_dc::eventbus::pb::{Event, PublishReply, PublishRequest, SubscribeReques
 use grpc_dc::eventbus::tags_match;
 use grpc_dc::eventbus_git::{export_events, import_events, init_event_log_repo, EVENT_LOG_BRANCH};
 use grpc_dc::{server_stream_method, unary_method, CallCtx, ResponseStream, ServiceDef, Status};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll, Waker};
+use turn_dag_wallet::{HotWallet, PqAddress, PqWallet};
 
 /// Per-subscriber queue bound, matching the upstream broker.
 pub const SUBSCRIBER_QUEUE_CAPACITY: usize = 128;
+
+// ---------------- signed event envelopes ----------------
+//
+// Every published event carries a CBOR envelope as its payload:
+// the browser's persistent wallet key (derived from a WebAuthn
+// PRF secret in the wallet app) certifies a short-lived ephemeral
+// ML-DSA keypair, and the ephemeral key signs each event. Git
+// commits therefore attribute events cryptographically to the
+// browser wallet, not merely to the server that appended them.
+// The broker verifies the full chain before appending: certified
+// ephemeral key, address derived from the wallet pubkey matching
+// publisher_id, cert not expired, per-ephemeral client sequence
+// strictly increasing (an exact signed envelope cannot replay).
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct CertCore {
+    v: u8,
+    wallet_addr: serde_bytes::ByteArray<20>,
+    wallet_pubkey: serde_bytes::ByteBuf,
+    ephemeral_pubkey: serde_bytes::ByteBuf,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EventCore {
+    v: u8,
+    cert_sha256: serde_bytes::ByteArray<32>,
+    client_seq: u64,
+    tags_pb: serde_bytes::ByteBuf,
+    payload: serde_bytes::ByteBuf,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SignedEnvelope {
+    cert_core: serde_bytes::ByteBuf,
+    cert_sig: serde_bytes::ByteBuf,
+    event_core: serde_bytes::ByteBuf,
+    event_sig: serde_bytes::ByteBuf,
+}
+
+/// A publish payload after successful signed-envelope verification.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifiedSignedEvent {
+    pub wallet: PqAddress,
+    pub ephemeral_pubkey: Vec<u8>,
+    pub client_seq: u64,
+    pub payload: Vec<u8>,
+}
+
+fn cbor<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    let mut out = Vec::new();
+    ciborium::into_writer(value, &mut out).expect("CBOR encode signed event");
+    out
+}
+
+fn tags_to_pb(tags: &[TagValue]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for tag in tags {
+        let bytes = tag.encode();
+        out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    out
+}
+
+fn tags_from_pb(mut bytes: &[u8]) -> Result<Vec<TagValue>, String> {
+    let mut tags = Vec::new();
+    while !bytes.is_empty() {
+        if bytes.len() < 4 {
+            return Err("truncated signed tag list".to_string());
+        }
+        let len = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let Some(rest) = bytes.get(4..4 + len) else {
+            return Err("truncated signed tag value".to_string());
+        };
+        tags.push(TagValue::decode(rest)?);
+        bytes = &bytes[4 + len..];
+    }
+    Ok(tags)
+}
+
+/// Build a signed publish payload. The wallet key certifies the
+/// ephemeral key until `expires_at_ms`; the ephemeral key signs
+/// this event. Mirrored byte-for-byte by web/signed-pubsub.js.
+pub fn sign_event_envelope(
+    wallet: &HotWallet,
+    ephemeral: &HotWallet,
+    issued_at_ms: u64,
+    expires_at_ms: u64,
+    client_seq: u64,
+    tags: &[TagValue],
+    payload: &[u8],
+) -> Vec<u8> {
+    let cert_core = cbor(&CertCore {
+        v: 1,
+        wallet_addr: serde_bytes::ByteArray::from(wallet.address().0),
+        wallet_pubkey: serde_bytes::ByteBuf::from(wallet.public_key().to_vec()),
+        ephemeral_pubkey: serde_bytes::ByteBuf::from(ephemeral.public_key().to_vec()),
+        issued_at_ms,
+        expires_at_ms,
+    });
+    let cert_sig = wallet.sign(&cert_core);
+    let event_core = cbor(&EventCore {
+        v: 1,
+        cert_sha256: serde_bytes::ByteArray::from(<[u8; 32]>::from(Sha256::digest(&cert_core))),
+        client_seq,
+        tags_pb: serde_bytes::ByteBuf::from(tags_to_pb(tags)),
+        payload: serde_bytes::ByteBuf::from(payload.to_vec()),
+    });
+    let event_sig = ephemeral.sign(&event_core);
+    cbor(&SignedEnvelope {
+        cert_core: serde_bytes::ByteBuf::from(cert_core),
+        cert_sig: serde_bytes::ByteBuf::from(cert_sig),
+        event_core: serde_bytes::ByteBuf::from(event_core),
+        event_sig: serde_bytes::ByteBuf::from(event_sig),
+    })
+}
+
+/// Verify a signed publish payload against the request's tags and
+/// claimed publisher. `Ok` carries the verified inner payload.
+pub fn verify_signed_event(
+    tags: &[TagValue],
+    envelope: &[u8],
+    publisher_id: &str,
+    now_ms: i64,
+) -> Result<VerifiedSignedEvent, String> {
+    let env: SignedEnvelope =
+        ciborium::from_reader(envelope).map_err(|e| format!("signed envelope CBOR: {e}"))?;
+    let cert: CertCore = ciborium::from_reader(env.cert_core.as_slice())
+        .map_err(|e| format!("certificate CBOR: {e}"))?;
+    let core: EventCore = ciborium::from_reader(env.event_core.as_slice())
+        .map_err(|e| format!("signed event CBOR: {e}"))?;
+    if cert.v != 1 || core.v != 1 {
+        return Err("unsupported signed event version".to_string());
+    }
+    let wallet_addr = PqAddress(cert.wallet_addr.into_array());
+    if PqAddress::from_pubkey(cert.wallet_pubkey.as_slice()) != wallet_addr {
+        return Err("wallet address does not match wallet pubkey".to_string());
+    }
+    let expected_publisher: String = wallet_addr
+        .0
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    if publisher_id != expected_publisher {
+        return Err("publisher_id is not the signing wallet address".to_string());
+    }
+    if now_ms < 0
+        || cert.issued_at_ms > now_ms as u64 + 300_000
+        || cert.expires_at_ms <= now_ms as u64
+        || cert.expires_at_ms > cert.issued_at_ms.saturating_add(24 * 60 * 60 * 1000)
+    {
+        return Err("ephemeral certificate expired or validity window invalid".to_string());
+    }
+    if !HotWallet::verify(
+        cert.wallet_pubkey.as_slice(),
+        env.cert_core.as_slice(),
+        env.cert_sig.as_slice(),
+    ) {
+        return Err("ephemeral certificate signature invalid".to_string());
+    }
+    let cert_hash: [u8; 32] = Sha256::digest(env.cert_core.as_slice()).into();
+    if cert_hash != *core.cert_sha256 {
+        return Err("event is not bound to this ephemeral certificate".to_string());
+    }
+    if !HotWallet::verify(
+        cert.ephemeral_pubkey.as_slice(),
+        env.event_core.as_slice(),
+        env.event_sig.as_slice(),
+    ) {
+        return Err("event signature invalid".to_string());
+    }
+    if tags_from_pb(core.tags_pb.as_slice())? != tags {
+        return Err("signed tags do not match publish tags".to_string());
+    }
+    Ok(VerifiedSignedEvent {
+        wallet: wallet_addr,
+        ephemeral_pubkey: cert.ephemeral_pubkey.into_vec(),
+        client_seq: core.client_seq,
+        payload: core.payload.into_vec(),
+    })
+}
+
+fn signed_counter_of(envelope: &[u8]) -> Option<(Vec<u8>, u64)> {
+    let env: SignedEnvelope = ciborium::from_reader(envelope).ok()?;
+    let cert: CertCore = ciborium::from_reader(env.cert_core.as_slice()).ok()?;
+    let core: EventCore = ciborium::from_reader(env.event_core.as_slice()).ok()?;
+    Some((cert.ephemeral_pubkey.into_vec(), core.client_seq))
+}
+
+/// Calendar current time in Unix milliseconds for verification.
+fn signed_now_ms() -> i64 {
+    now_unix_ms()
+}
 
 struct SubscriberState {
     filter: Vec<TagValue>,
@@ -35,6 +232,8 @@ struct BrokerState {
     seq: u64,
     published: u64,
     dropped: u64,
+    /// Highest accepted client_seq per ephemeral pubkey.
+    signed_client_seqs: std::collections::HashMap<Vec<u8>, u64>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -74,6 +273,13 @@ impl GitEventBusBroker {
         init_event_log_repo(&repo)?;
         let history = import_events(&repo, branch, &[], 0, 0)?;
         let seq = history.iter().map(|event| event.seq).max().unwrap_or(0);
+        let mut signed_client_seqs = std::collections::HashMap::new();
+        for event in &history {
+            if let Some((ephemeral, client_seq)) = signed_counter_of(&event.payload) {
+                let last: &mut u64 = signed_client_seqs.entry(ephemeral).or_default();
+                *last = (*last).max(client_seq);
+            }
+        }
         Ok(Arc::new(Self {
             repo,
             branch: branch.to_string(),
@@ -83,6 +289,7 @@ impl GitEventBusBroker {
                 seq,
                 published: history.len() as u64,
                 dropped: 0,
+                signed_client_seqs,
             }),
             queue_capacity: SUBSCRIBER_QUEUE_CAPACITY,
         }))
@@ -114,10 +321,23 @@ impl GitEventBusBroker {
         payload: Vec<u8>,
         publisher_id: &str,
     ) -> Result<Event, String> {
+        // Every RPC/direct publish must be a valid signed envelope:
+        // wallet-certified ephemeral key + per-key monotonic counter.
+        let verified = verify_signed_event(&tags, &payload, publisher_id, signed_now_ms())?;
         let mut last_error = String::new();
         for _ in 0..3 {
             let event = {
                 let mut state = self.state.lock().unwrap();
+                if state
+                    .signed_client_seqs
+                    .get(&verified.ephemeral_pubkey)
+                    .is_some_and(|last| verified.client_seq <= *last)
+                {
+                    return Err(format!(
+                        "replayed signed event client_seq {}",
+                        verified.client_seq
+                    ));
+                }
                 let existing = import_events(&self.repo, &self.branch, &[], state.seq, 0)?;
                 if let Some(max_seq) = existing.iter().map(|event| event.seq).max() {
                     state.seq = state.seq.max(max_seq);
@@ -154,6 +374,9 @@ impl GitEventBusBroker {
 
                 state.seq = event.seq;
                 state.published += 1;
+                state
+                    .signed_client_seqs
+                    .insert(verified.ephemeral_pubkey.clone(), verified.client_seq);
                 self.fan_out_locked(&mut state, &event);
                 event
             };
@@ -342,19 +565,75 @@ mod tests {
         }
     }
 
+    fn signed_payload(
+        wallet: &HotWallet,
+        ephemeral: &HotWallet,
+        client_seq: u64,
+        tags: &[TagValue],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let now = signed_now_ms() as u64;
+        sign_event_envelope(
+            wallet,
+            ephemeral,
+            now.saturating_sub(1_000),
+            now + 3_600_000,
+            client_seq,
+            tags,
+            payload,
+        )
+    }
+
+    fn publisher(wallet: &HotWallet) -> String {
+        wallet
+            .address()
+            .0
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn inner(event: &Event) -> Vec<u8> {
+        verify_signed_event(
+            &event.tags,
+            &event.payload,
+            &event.publisher_id,
+            signed_now_ms(),
+        )
+        .unwrap()
+        .payload
+    }
+
     #[test]
     fn branch_is_durable_log_replay_and_live_tail() {
         let repo = temp_repo("durable");
         let broker = GitEventBusBroker::open(&repo).unwrap();
+        let wallet = HotWallet::generate(&[90u8; 32]).unwrap();
+        let ephemeral = HotWallet::generate(&[91u8; 32]).unwrap();
+        let publisher_id = publisher(&wallet);
         let orders = vec![tag_string(Tag::Topic, "orders")];
         let other = vec![tag_string(Tag::Topic, "other")];
 
         let first = broker
-            .publish_event(orders.clone(), b"o1".to_vec(), "test")
+            .publish_event(
+                orders.clone(),
+                signed_payload(&wallet, &ephemeral, 1, &orders, b"o1"),
+                &publisher_id,
+            )
             .unwrap();
-        broker.publish_event(other, b"x1".to_vec(), "test").unwrap();
+        broker
+            .publish_event(
+                other.clone(),
+                signed_payload(&wallet, &ephemeral, 2, &other, b"x1"),
+                &publisher_id,
+            )
+            .unwrap();
         let third = broker
-            .publish_event(orders.clone(), b"o2".to_vec(), "test")
+            .publish_event(
+                orders.clone(),
+                signed_payload(&wallet, &ephemeral, 3, &orders, b"o2"),
+                &publisher_id,
+            )
             .unwrap();
         assert_eq!((first.seq, third.seq), (1, 3));
 
@@ -366,20 +645,24 @@ mod tests {
                 .history(&orders)
                 .unwrap()
                 .iter()
-                .map(|event| event.payload.clone())
+                .map(inner)
                 .collect::<Vec<_>>(),
             vec![b"o1".to_vec(), b"o2".to_vec()]
         );
 
         let mut stream = reopened.subscribe_stream(orders.clone()).unwrap();
-        assert_eq!(next(&mut stream).payload, b"o1");
-        assert_eq!(next(&mut stream).payload, b"o2");
+        assert_eq!(inner(&next(&mut stream)), b"o1");
+        assert_eq!(inner(&next(&mut stream)), b"o2");
         assert!(matches!(poll(&mut stream), Poll::Pending));
 
         reopened
-            .publish_event(orders, b"o3".to_vec(), "test")
+            .publish_event(
+                orders.clone(),
+                signed_payload(&wallet, &ephemeral, 4, &orders, b"o3"),
+                &publisher_id,
+            )
             .unwrap();
-        assert_eq!(next(&mut stream).payload, b"o3");
+        assert_eq!(inner(&next(&mut stream)), b"o3");
 
         let count = std::process::Command::new("git")
             .args([
@@ -399,14 +682,52 @@ mod tests {
     }
 
     #[test]
+    fn unsigned_tampered_and_replayed_events_are_rejected() {
+        let repo = temp_repo("signed-negatives");
+        let broker = GitEventBusBroker::open(&repo).unwrap();
+        let wallet = HotWallet::generate(&[94u8; 32]).unwrap();
+        let ephemeral = HotWallet::generate(&[95u8; 32]).unwrap();
+        let tags = vec![tag_string(Tag::Topic, "orders")];
+        let publisher_id = publisher(&wallet);
+
+        // Plain unsigned protobuf payloads are no longer accepted.
+        assert!(broker
+            .publish_event(tags.clone(), b"raw".to_vec(), &publisher_id)
+            .is_err());
+
+        let signed = signed_payload(&wallet, &ephemeral, 1, &tags, b"o1");
+        broker
+            .publish_event(tags.clone(), signed.clone(), &publisher_id)
+            .unwrap();
+        // Exact envelope replay: signature is valid, counter is not.
+        let replay = broker.publish_event(tags.clone(), signed, &publisher_id);
+        assert!(
+            format!("{replay:?}").contains("replayed signed event"),
+            "{replay:?}"
+        );
+
+        // Tamper with the next envelope's signature bytes.
+        let mut tampered = signed_payload(&wallet, &ephemeral, 2, &tags, b"o2");
+        let last = tampered.len() - 1;
+        tampered[last] ^= 1;
+        assert!(broker.publish_event(tags, tampered, &publisher_id).is_err());
+
+        assert_eq!(broker.history(&[]).unwrap().len(), 1);
+        std::fs::remove_dir_all(&repo).unwrap();
+    }
+
+    #[test]
     fn branch_commits_use_upstream_event_format() {
         let repo = temp_repo("format");
         let broker = GitEventBusBroker::open_branch(&repo, "events/custom").unwrap();
+        let wallet = HotWallet::generate(&[92u8; 32]).unwrap();
+        let ephemeral = HotWallet::generate(&[93u8; 32]).unwrap();
+        let tags = vec![tag_string(Tag::Topic, "orders")];
         broker
             .publish_event(
-                vec![tag_string(Tag::Topic, "orders")],
-                b"o1".to_vec(),
-                "test",
+                tags.clone(),
+                signed_payload(&wallet, &ephemeral, 1, &tags, b"o1"),
+                &publisher(&wallet),
             )
             .unwrap();
 
@@ -414,7 +735,7 @@ mod tests {
         // git log carries the same human-readable trailer index.
         let imported = import_events(&repo, "events/custom", &[], 0, 0).unwrap();
         assert_eq!(imported.len(), 1);
-        assert_eq!(imported[0].payload, b"o1");
+        assert_eq!(inner(&imported[0]), b"o1");
         let log = std::process::Command::new("git")
             .args([
                 "-C",

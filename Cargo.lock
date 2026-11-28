@@ -1248,10 +1248,14 @@ dependencies = [
 name = "turn-dag-node"
 version = "0.1.0"
 dependencies = [
+ "ciborium",
  "dc-webrtc",
  "futures-util",
  "getrandom 0.4.3",
  "grpc-dc",
+ "serde",
+ "serde_bytes",
+ "sha2",
  "smoltcp",
  "turn-dag-element",
  "turn-dag-ledger",

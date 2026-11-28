@@ -1240,6 +1240,32 @@ try {
         const addrFresh = (await page.textContent('#address')).trim();
         record('browser-wallet:fresh-page-recovery', addrFresh === signed.addressHex ? 'PASS' : 'FAIL',
           `after reload, passkey re-derives ${addrFresh} (no re-registration)`);
+        // Passkey-signed pub/sub: on the gRPC page the same
+        // passkey re-unlocks the same wallet, which certifies the
+        // ephemeral publishing key. The received envelopes must
+        // attribute to the PRF-derived wallet address.
+        if (process.env.TURN_TCP_URL && process.env.GRPC_DESCRIPTOR_FILE) {
+          const descriptor = JSON.parse(fs.readFileSync(process.env.GRPC_DESCRIPTOR_FILE, 'utf8'));
+          await page.goto(`http://localhost:${pagePort}/wallet-app/grpc.html`);
+          await page.waitForFunction(() => !!window.__grpcPubSub, null, { timeout: 20000 });
+          await page.click('#btn-grpc-unlock');
+          await page.waitForFunction(
+            () => document.getElementById('signer').textContent.includes('webauthn-prf'),
+            null,
+            { timeout: 20000 },
+          );
+          const topic = `orders-passkey-${Date.now()}`;
+          const signedPubSub = await page.evaluate(
+            async ({ d, t, u, p, topic }) => window.__grpcPubSub(d, t, u, p, topic),
+            { d: descriptor, t: process.env.TURN_TCP_URL, u: USER, p: PASS, topic },
+          );
+          const passkeySignedOk = signedPubSub?.live?.map((e) => e.payload).join(',') === 'o1,o2'
+            && signedPubSub?.replayed?.map((e) => e.payload).join(',') === 'o1,o2,o3'
+            && signedPubSub?.live?.every((e) => e.walletAddress === signed.addressHex)
+            && signedPubSub?.replayed?.every((e) => e.walletAddress === signed.addressHex);
+          record('grpc:passkey-signed-pubsub-over-turn-tcp', passkeySignedOk ? 'PASS' : 'FAIL',
+            `ephemeral events certified by PRF wallet ${signed.addressHex}, seqs=${signedPubSub?.seqs?.join(',')}`);
+        }
         // Wrong authenticator: a fresh browser process whose (empty)
         // virtual authenticator does not hold the passkey cannot unlock.
         const wrongBrowser = await chromium.launch({ args: ['--no-sandbox'] });
@@ -1403,6 +1429,7 @@ try {
               JSON.stringify(result).slice(0, 250));
           }
 
+          await pg.evaluate((seed) => window.__grpcUseDemoWallet(seed), ({ firefox: 'a1', chromium: 'b2', webkit: 'c3' }[name]).repeat(32));
           const topic = `orders-${name}-${Date.now()}`;
           const pubSubCall = pg.evaluate(
             async ({ d, t, u, p, topic }) => window.__grpcPubSub(d, t, u, p, topic),
@@ -1466,6 +1493,8 @@ try {
           fxPage.waitForFunction(() => !!window.__grpcPubSubStart, null, { timeout: 20000 }),
           crPage.waitForFunction(() => !!window.__grpcPubSubStart, null, { timeout: 20000 }),
         ]);
+        await fxPage.evaluate((seed) => window.__grpcUseDemoWallet(seed), 'd4'.repeat(32));
+        await crPage.evaluate((seed) => window.__grpcUseDemoWallet(seed), 'e5'.repeat(32));
         const base = { d: grpcDescriptor, t: turnTcpUrl, u: USER, p: PASS };
         const start = (page, sessionId, topic) => page.evaluate(
           async ({ d, t, u, p, sessionId, topic }) => window.__grpcPubSubStart(sessionId, d, t, u, p, topic),
@@ -1574,6 +1603,7 @@ try {
             wkPage = await wkBrowser.newPage();
             await wkPage.goto(`http://localhost:${pagePort}/wallet-app/grpc.html`);
             await wkPage.waitForFunction(() => !!window.__grpcPubSubStart, null, { timeout: 20000 });
+            await wkPage.evaluate((seed) => window.__grpcUseDemoWallet(seed), 'f6'.repeat(32));
           } catch (e) {
             record('grpc:webkit-cross-instance-pubsub-over-turn-tcp', 'SKIP', `WebKit launch failed: ${String(e).slice(0, 180)}`);
             record('grpc:webkit-cross-instance-replay-over-turn-tcp', 'SKIP', 'WebKit unavailable for cross-instance replay');
