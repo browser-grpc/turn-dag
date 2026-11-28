@@ -41,6 +41,80 @@ window.__grpcEcho = async (descriptor, turnUrl, username, credential, message) =
   }
 };
 
+// Session-scoped pub/sub primitives let Playwright orchestrate
+// multiple browser instances: one page can subscribe while a
+// different browser process publishes, rather than both roles
+// being folded into the single-page helper below.
+const pubSubSessions = new Map();
+
+window.__grpcPubSubStart = async (
+  sessionId,
+  descriptor,
+  turnUrl,
+  username,
+  credential,
+  topic = null,
+) => {
+  if (pubSubSessions.has(sessionId)) throw new Error(`duplicate pub/sub session ${sessionId}`);
+  const channel = await dial(descriptor, turnUrl, username, credential);
+  const session = {
+    channel,
+    client: new EventBusClient(channel),
+    received: [],
+    iterator: null,
+    error: null,
+    pairType: await pairType(channel.peerConnection),
+  };
+  pubSubSessions.set(sessionId, session);
+  if (topic) {
+    const stream = await subscribeEvents(session.client, [tagString(Tag.TOPIC, topic)]);
+    session.iterator = stream[Symbol.asyncIterator]();
+    session.collector = (async () => {
+      try {
+        for (;;) {
+          const step = await session.iterator.next();
+          if (step.done) return;
+          session.received.push({
+            payload: new TextDecoder().decode(step.value.payload),
+            seq: Number(step.value.seq),
+          });
+        }
+      } catch (e) {
+        session.error = String(e);
+      }
+    })();
+  }
+  return { pairType: session.pairType };
+};
+
+window.__grpcPubSubPublish = async (sessionId, topic, payload) => {
+  const session = pubSubSessions.get(sessionId);
+  if (!session) throw new Error(`unknown pub/sub session ${sessionId}`);
+  const seq = await publishEvent(
+    session.client,
+    [tagString(Tag.TOPIC, topic)],
+    new TextEncoder().encode(payload),
+    'browser-pubsub',
+  );
+  return Number(seq);
+};
+
+window.__grpcPubSubReceived = (sessionId) => {
+  const session = pubSubSessions.get(sessionId);
+  if (!session) throw new Error(`unknown pub/sub session ${sessionId}`);
+  if (session.error) throw new Error(session.error);
+  return [...session.received];
+};
+
+window.__grpcPubSubClose = async (sessionId) => {
+  const session = pubSubSessions.get(sessionId);
+  if (!session) return;
+  await session.iterator?.return().catch(() => {});
+  await session.collector?.catch(() => {});
+  session.channel.closeRendezvous();
+  pubSubSessions.delete(sessionId);
+};
+
 window.__grpcPubSub = async (descriptor, turnUrl, username, credential, topic = 'orders') => {
   const enc = (s) => new TextEncoder().encode(s);
   const dec = (b) => new TextDecoder().decode(b);

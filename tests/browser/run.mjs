@@ -1437,6 +1437,137 @@ try {
         try { await b?.close(); } catch {}
       }
     }
+    // True two-instance pub/sub: separate Firefox and Chromium
+    // browser processes, simultaneously subscribed. Each direction
+    // is exercised; both subscribers (including the publisher's
+    // own instance) must receive only topic-matching events.
+    if (grpcDescriptor && ENGINES.includes('firefox') && ENGINES.includes('chromium')) {
+      let fxBrowser;
+      let crBrowser;
+      const waitReceived = async (page, sessionId, count) => {
+        await page.waitForFunction(
+          ([id, expected]) => window.__grpcPubSubReceived(id).length >= expected,
+          [sessionId, count],
+          { timeout: 25000 },
+        );
+        return page.evaluate((id) => window.__grpcPubSubReceived(id), sessionId);
+      };
+      try {
+        fxBrowser = await firefox.launch({ args: ['--no-sandbox'] });
+        crBrowser = await chromium.launch({ args: ['--no-sandbox'] });
+        const fxPage = await fxBrowser.newPage();
+        const crPage = await crBrowser.newPage();
+        await Promise.all([
+          fxPage.goto(`http://localhost:${pagePort}/wallet-app/grpc.html`),
+          crPage.goto(`http://localhost:${pagePort}/wallet-app/grpc.html`),
+        ]);
+        await Promise.all([
+          fxPage.waitForFunction(() => !!window.__grpcPubSubStart, null, { timeout: 20000 }),
+          crPage.waitForFunction(() => !!window.__grpcPubSubStart, null, { timeout: 20000 }),
+        ]);
+        const base = { d: grpcDescriptor, t: turnTcpUrl, u: USER, p: PASS };
+        const start = (page, sessionId, topic) => page.evaluate(
+          async ({ d, t, u, p, sessionId, topic }) => window.__grpcPubSubStart(sessionId, d, t, u, p, topic),
+          { ...base, sessionId, topic },
+        );
+        const publish = (page, sessionId, topic, payload) => page.evaluate(
+          async ({ sessionId, topic, payload }) => window.__grpcPubSubPublish(sessionId, topic, payload),
+          { sessionId, topic, payload },
+        );
+        const close = (page, sessionId) => page.evaluate(
+          async (id) => window.__grpcPubSubClose(id), sessionId,
+        );
+
+        const runDirection = async (publisherPage, subscriberPages, topic, first, second) => {
+          const seqs = [];
+          seqs.push(await publish(publisherPage, 'peer', topic, first));
+          seqs.push(await publish(publisherPage, 'peer', 'other', 'noise'));
+          seqs.push(await publish(publisherPage, 'peer', topic, second));
+          const received = [];
+          for (const page of subscriberPages) received.push(await waitReceived(page, 'peer', 2));
+          return { seqs, received };
+        };
+        const expectEvents = (events, payloads, seqs) => events.length === payloads.length
+          && events.every((event, i) => event.payload === payloads[i] && event.seq === seqs[i]);
+
+        let crossDetail = '';
+        try {
+          const topicA = `orders-cross-a-${Date.now()}`;
+          const startsA = await Promise.all([
+            start(fxPage, 'peer', topicA),
+            start(crPage, 'peer', topicA),
+          ]);
+          await Promise.all([
+            fxPage.waitForTimeout(500),
+            crPage.waitForTimeout(500),
+          ]);
+          const a = await runDirection(crPage, [fxPage, crPage], topicA, 'a1', 'a2');
+          const aOk = startsA.every((start) => start.pairType?.startsWith('relay/'))
+            && expectEvents(a.received[0], ['a1', 'a2'], [a.seqs[0], a.seqs[2]])
+            && expectEvents(a.received[1], ['a1', 'a2'], [a.seqs[0], a.seqs[2]]);
+
+          const topicB = `orders-cross-b-${Date.now()}`;
+          await Promise.all([
+            start(fxPage, 'peer2', topicB),
+            start(crPage, 'peer2', topicB),
+          ]);
+          await Promise.all([
+            fxPage.waitForTimeout(500),
+            crPage.waitForTimeout(500),
+          ]);
+          // runDirection reads the fixed 'peer' session for received
+          // events, so use explicit publishing for the second topic.
+          const seqB = [];
+          seqB.push(await publish(fxPage, 'peer2', topicB, 'b1'));
+          seqB.push(await publish(fxPage, 'peer2', 'other', 'noise'));
+          seqB.push(await publish(fxPage, 'peer2', topicB, 'b2'));
+          const bFx = await waitReceived(fxPage, 'peer2', 2);
+          const bCr = await waitReceived(crPage, 'peer2', 2);
+          const bOk = expectEvents(bFx, ['b1', 'b2'], [seqB[0], seqB[2]])
+            && expectEvents(bCr, ['b1', 'b2'], [seqB[0], seqB[2]]);
+          crossDetail = `chromium->firefox seqs=${a.seqs.join(',')} firefox->chromium seqs=${seqB.join(',')}`;
+          recordNet('grpc:cross-instance-pubsub-over-turn-tcp', aOk && bOk,
+            `two instances/engines, both directions; ${crossDetail}`,
+            JSON.stringify({ a, bFx, bCr, seqB }).slice(0, 300));
+          await Promise.all([
+            close(fxPage, 'peer'), close(crPage, 'peer'),
+            close(fxPage, 'peer2'), close(crPage, 'peer2'),
+          ]);
+        } catch (e) {
+          recordNet('grpc:cross-instance-pubsub-over-turn-tcp', false, '', String(e).slice(0, 300));
+        }
+
+        try {
+          const replayTopic = `orders-cross-replay-${Date.now()}`;
+          await start(fxPage, 'replay-publisher', null);
+          const rSeqs = [];
+          rSeqs.push(await publish(fxPage, 'replay-publisher', replayTopic, 'r1'));
+          rSeqs.push(await publish(fxPage, 'replay-publisher', replayTopic, 'r2'));
+          await close(fxPage, 'replay-publisher');
+
+          await start(crPage, 'replay-subscriber', replayTopic);
+          const replayed = await waitReceived(crPage, 'replay-subscriber', 2);
+
+          await start(fxPage, 'replay-publisher-2', null);
+          rSeqs.push(await publish(fxPage, 'replay-publisher-2', replayTopic, 'r3'));
+          const afterLive = await waitReceived(crPage, 'replay-subscriber', 3);
+          const replayOk = expectEvents(replayed, ['r1', 'r2'], [rSeqs[0], rSeqs[1]])
+            && expectEvents(afterLive, ['r1', 'r2', 'r3'], rSeqs);
+          recordNet('grpc:cross-instance-replay-over-turn-tcp', replayOk,
+            `Firefox published/disconnected, Chromium replayed from git then received live; seqs=${rSeqs.join(',')}`,
+            JSON.stringify({ replayed, afterLive, rSeqs }).slice(0, 300));
+          await close(crPage, 'replay-subscriber');
+          await close(fxPage, 'replay-publisher-2');
+        } catch (e) {
+          recordNet('grpc:cross-instance-replay-over-turn-tcp', false, '', String(e).slice(0, 300));
+        }
+      } catch (e) {
+        recordNet('grpc:cross-instance-pubsub-over-turn-tcp', false, '', String(e).slice(0, 300));
+      } finally {
+        try { await fxBrowser?.close(); } catch {}
+        try { await crBrowser?.close(); } catch {}
+      }
+    }
   } else {
     record('tcp:turn-tcp', 'SKIP', 'no TURN_TCP_URL (needs TUN-backed serve-grpc)');
   }
