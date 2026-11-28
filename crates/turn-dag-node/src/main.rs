@@ -159,6 +159,9 @@ fn mint_challenge_cmd(args: &[String]) -> i32 {
         .and_then(|v| hex_decode(&v))
         .and_then(|b| <[u8; 32]>::try_from(b).ok())
         .unwrap_or([0u8; 32]);
+    if args.iter().any(|a| a == "--production") {
+        println!("params=production");
+    }
     let ch = turn_dag_minter::derive_challenge(epoch, &miner, &frontier);
     println!("miner={}", hex(&miner.0));
     println!("challenge={}", hex(&ch));
@@ -193,7 +196,11 @@ fn mint_verify_cmd(args: &[String]) -> i32 {
         eprintln!("mint-verify needs --hash HEX64");
         return 2;
     };
-    let cfg = turn_dag_minter::MinterConfig::cheap_for_tests();
+    let cfg = if args.iter().any(|a| a == "--production") {
+        turn_dag_minter::MinterConfig::default()
+    } else {
+        turn_dag_minter::MinterConfig::cheap_for_tests()
+    };
     let challenge_bytes = turn_dag_minter::derive_challenge(epoch, &miner, &frontier);
     let challenge = turn_dag_minter::MintChallenge {
         epoch,

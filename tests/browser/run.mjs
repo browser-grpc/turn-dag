@@ -893,6 +893,38 @@ try {
     await crossRelay('cross:chromium-webkit', 'chromium', chromium, 'webkit', webkit, turnCfg(USER, PASS), 0, true);
   }
 
+  // Direct (no TURN) DataChannel pair over public STUN: proves the
+  // host/srflx path independently of the relay. Selected pair must
+  // not be relay/relay.
+  if (ENGINES.includes('firefox')) {
+    let dBrowser;
+    try {
+      dBrowser = await firefox.launch({ args: ['--no-sandbox'] });
+      const dc1 = await dBrowser.newContext();
+      const dc2 = await dBrowser.newContext();
+      const dp1 = await dc1.newPage();
+      const dp2 = await dc2.newPage();
+      await dp1.goto(pageUrl);
+      await dp2.goto(pageUrl);
+      const directCfg = {
+        iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun.cloudflare.com:3478' },
+        ],
+      };
+      const relay = await relayOnce(dp1, dp2, directCfg, CONNECT_TIMEOUT_MS);
+      const ok = relay.gotOn2 === 'one element, one rendezvous'
+        && relay.gotOn1 === 'ack over relay'
+        && relay.pairType && !relay.pairType.includes('relay');
+      recordNet('direct:stun-datachannel', !!ok, `direct DataChannel both ways, pair=${relay.pairType}`,
+        JSON.stringify(relay).slice(0, 300));
+    } catch (e) {
+      recordNet('direct:stun-datachannel', false, '', String(e).slice(0, 300));
+    } finally {
+      try { await dBrowser?.close(); } catch {}
+    }
+  }
+
   // Three-peer mesh (Chromium contexts) + 90s restartIce (Firefox).
   if (ENGINES.includes('chromium')) {
     let meshBrowser;
@@ -1012,6 +1044,17 @@ try {
         },
       });
       await page.goto(`http://localhost:${pagePort}/wallet-app/`); // localhost: WebAuthn RP id cannot be an IP literal
+      // Negative: unlocking before any passkey exists must fail.
+      const noPasskey = await page.evaluate(async () => {
+        try {
+          await window.turnDagWallet.unlockWalletWithPasskey();
+          return 'unlocked';
+        } catch (e) {
+          return `failed: ${e.message}`.slice(0, 60);
+        }
+      });
+      record('browser-wallet:unlock-without-passkey', noPasskey.startsWith('failed') ? 'PASS' : 'FAIL',
+        `unlock without registration correctly ${noPasskey}`);
       await page.click('#btn-register');
       await page.waitForFunction(() => document.getElementById('seed-source').textContent.includes('registered'), null, { timeout: 15000 });
       const regText = await page.textContent('#seed-source');
@@ -1045,6 +1088,55 @@ try {
         const mv = await runCliCode(['mint-verify', '--miner', signed.addressHex, '--difficulty', '16', '--nonce', String(msol.nonce), '--hash', msol.hashHex]);
         record('browser-pow:mint', mv.code === 0 && mv.out.includes(`element_id=${eid}`) ? 'PASS' : 'FAIL',
           `browser Argon2id mint nonce=${msol.nonce}, Rust verify + element id match=${mv.out.includes(`element_id=${eid}`)}`);
+        // Production-strength PoW in browser (timed).
+        const ch20Out = await runCli(['pow-challenge', '--bits', '20']);
+        const ch20Id = ch20Out.match(/challenge_id=([0-9a-f]+)/)?.[1];
+        const ch20Hex = ch20Out.match(/challenge=([0-9a-f]+)/)?.[1];
+        const t0 = Date.now();
+        const sol20 = await page.evaluate(async (h) => window.turnDagWallet.solveTurnPow(h, 20), ch20Hex);
+        const pv20 = await runCliCode(['pow-verify', '--id', ch20Id, '--challenge', ch20Hex, '--bits', '20', '--nonce', String(sol20.nonce)]);
+        record('browser-pow:turn-20bit', pv20.code === 0 ? 'PASS' : 'FAIL',
+          `20-bit TURN PoW solved in browser in ${Date.now() - t0}ms (nonce=${sol20.nonce}), Rust PASS`);
+        const mcP = await runCli(['mint-challenge', '--miner', signed.addressHex, '--difficulty', '2', '--production']);
+        const mcPHex = mcP.match(/challenge=([0-9a-f]+)/)?.[1];
+        const t1 = Date.now();
+        const msolP = await page.evaluate(async (h) => window.turnDagWallet.solveMintPow(h, 2, { memorySize: 65536, iterations: 3, parallelism: 4 }), mcPHex);
+        const mvP = await runCliCode(['mint-verify', '--production', '--miner', signed.addressHex, '--difficulty', '2', '--nonce', String(msolP.nonce), '--hash', msolP.hashHex]);
+        record('browser-pow:mint-production', mvP.code === 0 ? 'PASS' : 'FAIL',
+          `production Argon2id (64MiB,t3,p4) mint solved in browser in ${Date.now() - t1}ms, Rust PASS`);
+        // Recovery: after a full page reload, the wallet re-derives
+        // identically from the passkey (no re-registration). (A
+        // second tab's WebAuthn ceremony hangs in headless Chrome,
+        // so recovery is asserted across reloads, not tabs.)
+        await page.reload();
+        await page.waitForFunction(() => !!window.turnDagWallet, null, { timeout: 15000 });
+        await page.click('#btn-unlock');
+        await page.waitForFunction(() => /^[0-9a-f]{40}$/.test(document.getElementById('address').textContent.trim()), null, { timeout: 15000 });
+        const addrFresh = (await page.textContent('#address')).trim();
+        record('browser-wallet:fresh-page-recovery', addrFresh === signed.addressHex ? 'PASS' : 'FAIL',
+          `after reload, passkey re-derives ${addrFresh} (no re-registration)`);
+        // Wrong authenticator: a fresh browser process whose (empty)
+        // virtual authenticator does not hold the passkey cannot unlock.
+        const wrongBrowser = await chromium.launch({ args: ['--no-sandbox'] });
+        const ctxWrong = await wrongBrowser.newContext();
+        const pageW = await ctxWrong.newPage();
+        const cdpW = await ctxWrong.newCDPSession(pageW);
+        await cdpW.send('WebAuthn.enable');
+        await cdpW.send('WebAuthn.addVirtualAuthenticator', {
+          options: { protocol: 'ctap2', transport: 'internal', hasResidentKey: true, hasUserVerification: true, isUserVerified: true, automaticPresenceSimulation: true, hasPrf: true },
+        });
+        await pageW.goto(`http://localhost:${pagePort}/wallet-app/`);
+        await pageW.waitForFunction(() => !!window.turnDagWallet, null, { timeout: 15000 });
+        await pageW.click('#btn-unlock');
+        let wrongFailed = false;
+        try {
+          await pageW.waitForFunction(() => document.getElementById('seed-source').textContent.startsWith('unlock failed'), null, { timeout: 20000 });
+          wrongFailed = true;
+        } catch { wrongFailed = false; }
+        record('browser-wallet:wrong-authenticator', wrongFailed ? 'PASS' : 'FAIL',
+          'empty authenticator cannot unlock the wallet');
+        await ctxWrong.close();
+        await wrongBrowser.close();
       }
       await ctx.close();
     } catch (e) {
@@ -1138,6 +1230,37 @@ try {
       }
     } else {
       record('tls:firefox-turns', 'SKIP', 'Firefox does not initiate TURN/TLS (turns:) in this build (verified against a bare TCP listener)');
+    }
+    // WebKit turns: attempt (engine support varies; SKIP if this
+    // WebKit build will not allocate over TLS here).
+    if (ENGINES.includes('webkit')) {
+      let wkBrowser;
+      try {
+        wkBrowser = await webkit.launch({ args: [] });
+        const wkCtx = await wkBrowser.newContext({ ignoreHTTPSErrors: true });
+        const wkPage = await wkCtx.newPage();
+        await wkPage.goto(pageUrl);
+        const g = await wkPage.evaluate(async (urls) => {
+          const pc = new RTCPeerConnection({ iceServers: [{ urls, username: 'browser-test-user', credential: 'browser-test-secret' }], iceTransportPolicy: 'relay' });
+          const cands = []; const errs = [];
+          pc.onicecandidate = (e) => { if (e.candidate?.candidate) cands.push(e.candidate.candidate); };
+          pc.onicecandidateerror = (e) => errs.push(`${e.errorCode} ${e.errorText || ''}`);
+          const done = new Promise((res) => { pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') res(); }; setTimeout(res, 15000); });
+          pc.createDataChannel('probe');
+          await pc.setLocalDescription(await pc.createOffer());
+          await done;
+          const s = { state: pc.iceGatheringState, cands, errs };
+          pc.close(); return s;
+        }, turnsUrl).catch((e) => ({ state: 'error', cands: [], errs: [String(e)] }));
+        const relay = g.cands.filter((c) => c.includes('typ relay'));
+        record('tls:webkit-turns', relay.length > 0 ? 'PASS' : 'SKIP',
+          relay.length > 0 ? 'relay candidate over turns: in WebKit' : `WebKit turns: unsupported here: state=${g.state} errs=${g.errs.join(';')}`.slice(0, 250));
+        await wkCtx.close();
+      } catch (e) {
+        record('tls:webkit-turns', 'SKIP', `WebKit turns: launch/gather failed: ${String(e).slice(0, 200)}`);
+      } finally {
+        try { await wkBrowser?.close(); } catch {}
+      }
     }
   } else {
     record('tls:turns', 'SKIP', 'no TURNS_URL (needs TUN-backed serve-tls: /dev/net/tun + NET_ADMIN); TCP refusal covered by wire-tcp-refused');

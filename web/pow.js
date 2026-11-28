@@ -43,7 +43,11 @@ export async function solveTurnPow(challengeHex, bits) {
   }
 }
 
-export async function solveMintPow(challengeHex, difficulty) {
+// Argon parameters default to MinterConfig::cheap_for_tests;
+// pass the production shape (64MiB, t=3, p=4) to solve at
+// production cost.
+export async function solveMintPow(challengeHex, difficulty, params = {}) {
+  const { memorySize = 256, iterations = 1, parallelism = 1 } = params;
   const challenge = hexToBytes(challengeHex);
   const diff = BigInt(difficulty);
   for (let nonce = 0; ; nonce++) {
@@ -53,9 +57,9 @@ export async function solveMintPow(challengeHex, difficulty) {
     const hash = await argon2id({
       password,
       salt: challenge.slice(0, 16),
-      parallelism: 1,
-      iterations: 1,
-      memorySize: 256,
+      parallelism,
+      iterations,
+      memorySize,
       hashLength: 32,
       outputType: 'binary',
     });

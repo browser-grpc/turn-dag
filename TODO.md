@@ -255,10 +255,10 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   ChannelData stream framing in `take_frame`). Firefox turns:
   SKIPs with evidence — packet capture shows this Firefox build
   attempts `turn:?transport=tcp` but never initiates `turns:`.
-- Verified: `cargo test --workspace` (88 tests after the ledger cutover), clippy, fmt,
+- Verified: `cargo test --workspace` (89 tests after the ledger cutover), clippy, fmt,
   `docker build --target ci`, and
   `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
-  (45 passed, 1 skipped — Firefox turns — 0 failed).
+  (51 passed, 2 skipped — Firefox + WebKit turns — 0 failed).
 
 ## Virtual network, rate limiting, scale, CI gate (2026-11-25)
 
@@ -306,6 +306,29 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   (`to_cbor`/`from_cbor`, byte-string fields, canonical roundtrip
   test). Key references stay hash-based where appropriate:
   a 20-byte SHA3-256 digest stands in for the 1,952-byte pubkey.
+
+## Coverage gaps filled (2026-11-26)
+
+- **Burn-replay fixed**: `TurnIssuer` now keeps a spent-burn
+  registry — one burn = one relay pass (`BurnAlreadyRedeemed`, 409),
+  consumed only on success; symmetric-NAT two-ticket passes still
+  work, other-user replays do not allocate. Regression:
+  `same_burn_cannot_redeem_twice`. (Registry is in-memory like the
+  challenge store; persist it with the issuer state in production.)
+- **Production PoW in browser**: 20-bit TURN PoW and production
+  Argon2id (64MiB, t=3, p=4) solved in-page and verified by the
+  Rust CLI (`browser-pow:turn-20bit`, `browser-pow:mint-production`;
+  ~0.2-2.4s on CI-class hardware). Cheap-parameter tests remain.
+- **Direct path**: `direct:stun-datachannel` proves a full
+  DataChannel over public STUN with a non-relay selected pair
+  (host/prflx locally) — the direct path is no longer gather-only.
+- **Wallet negatives/recovery**: unlock without a passkey fails,
+  an empty/wrong authenticator cannot unlock, and after a page
+  reload the same passkey re-derives the identical wallet with
+  no re-registration (`browser-wallet:*`). Caveat: a second
+  *tab's* WebAuthn ceremony hangs in headless Chrome, so recovery
+  is asserted across reloads, not tabs.
+- **WebKit turns**: attempted in the TUN gate next to Chromium.
 
 ## Decisions (settled 2026-11-25, "go all, pick as needed")
 

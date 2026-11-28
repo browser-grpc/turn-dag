@@ -262,6 +262,7 @@ pub enum RedeemError {
     IpMismatch,
     BadPow,
     UnconfirmedBurn,
+    BurnAlreadyRedeemed,
     DeniedPeerIp,
     TcpRelayDenied,
     UserQuotaExceeded,
@@ -304,6 +305,9 @@ pub struct TurnIssuer<'a> {
     checker: &'a dyn BurnConfirmation,
     challenges: HashMap<[u8; 16], TurnPowChallenge>,
     used_challenges: std::collections::HashSet<[u8; 16]>,
+    /// Burns already redeemed for a relay pass (one burn = one pass,
+    /// however many tickets that pass legitimately carries).
+    spent_burns: std::collections::HashSet<[u8; 32]>,
     allocations: HashMap<String, TurnCredential>,
     /// user -> active ticket ids
     user_tickets: HashMap<String, Vec<String>>,
@@ -322,6 +326,7 @@ impl<'a> TurnIssuer<'a> {
             checker,
             challenges: HashMap::new(),
             used_challenges: Default::default(),
+            spent_burns: Default::default(),
             allocations: HashMap::new(),
             user_tickets: HashMap::new(),
             counter: 0,
@@ -427,6 +432,11 @@ impl<'a> TurnIssuer<'a> {
         if !self.checker.is_burn_confirmed(&req.burn_id) {
             return err(403, RedeemError::UnconfirmedBurn);
         }
+        // One burn buys one relay pass. Without this registry the
+        // same burn could be redeemed repeatedly with fresh PoWs.
+        if self.spent_burns.contains(&req.burn_id) {
+            return err(409, RedeemError::BurnAlreadyRedeemed);
+        }
         // Quotas: 1 ticket normally, 2 if both peers symmetric NAT.
         let tickets: usize = if req.both_symmetric_nat { 2 } else { 1 };
         let user_active = self
@@ -445,8 +455,9 @@ impl<'a> TurnIssuer<'a> {
             return err(429, RedeemError::BpsCapacityExceeded);
         }
 
-        // Consume the PoW challenge only on success (single-use).
+        // Consume the PoW challenge and the burn only on success.
         self.used_challenges.insert(req.pow.challenge_id);
+        self.spent_burns.insert(req.burn_id);
 
         let expires_at = now + self.policy.credential_lifetime_secs;
         let mut out = Vec::with_capacity(tickets);
@@ -725,6 +736,33 @@ mod tests {
     }
 
     #[test]
+    fn same_burn_cannot_redeem_twice() {
+        let checker = Confirmed;
+        let mut issuer = TurnIssuer::new(b"issuer-secret".to_vec(), fast_policy(), &checker);
+        let req = redeem_req(&mut issuer, "alice", 1_000);
+        assert!(issuer.handle_post_redeem(&req, 1_000).body.is_ok());
+        // A fresh challenge/PoW by a different user, same burn: replay.
+        let mut issuer2_req = redeem_req(&mut issuer, "mallory", 1_000);
+        issuer2_req.burn_id = [42u8; 32];
+        let resp = issuer.handle_post_redeem(&issuer2_req, 1_000);
+        assert_eq!(resp.status, 409);
+        assert_eq!(resp.body, Err(RedeemError::BurnAlreadyRedeemed));
+        assert_eq!(issuer.active_allocations(), 1, "replay must not allocate");
+        // A different burn still redeems fine (registry is per-burn).
+        let mut other = redeem_req(&mut issuer, "bob", 1_000);
+        other.burn_id = [43u8; 32];
+        assert!(issuer.handle_post_redeem(&other, 1_000).body.is_ok());
+        // Symmetric-NAT two-ticket pass still consumes its burn once.
+        let mut sym = redeem_req(&mut issuer, "carol", 1_000);
+        sym.burn_id = [44u8; 32];
+        sym.both_symmetric_nat = true;
+        assert_eq!(
+            issuer.handle_post_redeem(&sym, 1_000).body.unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
     fn unconfirmed_burn_gets_no_credential() {
         let checker = NeverConfirmed;
         let mut issuer = TurnIssuer::new(b"s".to_vec(), fast_policy(), &checker);
@@ -784,14 +822,16 @@ mod tests {
             issuer.handle_post_redeem(&req, 0).body,
             Err(RedeemError::ChallengeAlreadyUsed)
         );
-        // New challenge, same user: user-quota=1 blocks second rendezvous.
-        let req2 = redeem_req(&mut issuer, "alice", 0);
+        // New challenge, same user, fresh burn: quota blocks second pass.
+        let mut req2 = redeem_req(&mut issuer, "alice", 0);
+        req2.burn_id = [43u8; 32];
         assert_eq!(
             issuer.handle_post_redeem(&req2, 0).body,
             Err(RedeemError::UserQuotaExceeded)
         );
-        // After 120s expiry the quota frees.
-        let req3 = redeem_req(&mut issuer, "alice", 121);
+        // After 120s expiry the quota frees (another fresh burn).
+        let mut req3 = redeem_req(&mut issuer, "alice", 121);
+        req3.burn_id = [44u8; 32];
         assert!(issuer.handle_post_redeem(&req3, 121).body.is_ok());
     }
 
@@ -832,11 +872,13 @@ mod tests {
         };
         let mut issuer = TurnIssuer::new(b"s".to_vec(), policy, &checker);
         for i in 0..3 {
-            let req = redeem_req(&mut issuer, &format!("user{i}"), 0);
+            let mut req = redeem_req(&mut issuer, &format!("user{i}"), 0);
+            req.burn_id = [100 + i as u8; 32];
             assert!(issuer.handle_post_redeem(&req, 0).body.is_ok(), "user{i}");
         }
         assert_eq!(issuer.active_bps(), 3 * 16_384);
-        let req = redeem_req(&mut issuer, "user3", 0);
+        let mut req = redeem_req(&mut issuer, "user3", 0);
+        req.burn_id = [103u8; 32];
         let e = issuer.handle_post_redeem(&req, 0).body.unwrap_err();
         assert!(
             matches!(
