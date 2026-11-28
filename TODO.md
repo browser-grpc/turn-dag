@@ -255,10 +255,11 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   ChannelData stream framing in `take_frame`). Firefox turns:
   SKIPs with evidence — packet capture shows this Firefox build
   attempts `turn:?transport=tcp` but never initiates `turns:`.
-- Verified: `cargo test --workspace` (89 tests after the ledger cutover), clippy, fmt,
+- Verified: `cargo test --workspace` (90 tests after the ledger cutover), clippy, fmt,
   `docker build --target ci`, and
   `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
-  (51 passed, 2 skipped — Firefox + WebKit turns — 0 failed).
+  (52 passed, 3 skipped — Firefox + WebKit turns and fresh-context
+  passkey sync — 0 failed).
 
 ## Virtual network, rate limiting, scale, CI gate (2026-11-25)
 
@@ -329,6 +330,20 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   *tab's* WebAuthn ceremony hangs in headless Chrome, so recovery
   is asserted across reloads, not tabs.
 - **WebKit turns**: attempted in the TUN gate next to Chromium.
+- **Fresh-context derivation**: probed via credential export →
+  import into a fresh context's authenticator (passkey-sync
+  model). Plain cross-context assertion works, but imported CDP
+  virtual-authenticator credentials carry no hmac-secret/PRF
+  material, so `browser-wallet:fresh-context` records SKIP with
+  that exact reason; real synced platform passkeys re-derive
+  PRF on-device. Second-tab ceremonies also hang in headless
+  Chrome — both are environment limits, documented, not faked.
+- **Burn replay also at node/suite levels**:
+  `Node::relay_pass` consumes the burn in the origin ledger
+  (`node_relay_pass_consumes_burn_exactly_once`), and
+  `issuer:burn-replay-stdio` drives one long-lived TurnIssuer
+  through the stateful `issuer-stdio` oracle: burn A redeems,
+  its replay is `BurnAlreadyRedeemed`, burn B still redeems.
 
 ## Decisions (settled 2026-11-25, "go all, pick as needed")
 

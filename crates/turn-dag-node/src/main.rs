@@ -57,7 +57,118 @@ fn main() {
     if cmd == "sig-verify" {
         std::process::exit(sig_verify_cmd(&args[2..]));
     }
+    if cmd == "issuer-stdio" {
+        std::process::exit(issuer_stdio());
+    }
     std::process::exit(run(cmd));
+}
+
+/// Stateful issuer oracle over stdin/stdout (line protocol), used by
+/// the Playwright suite to prove cross-request issuer behavior
+/// (notably burn-replay rejection) through the real TurnIssuer.
+/// Burns are treated as confirmed (checker stub): the ledger-level
+/// burn gate is proven in the Rust/node tests; this oracle proves
+/// the issuer's own spent-burn registry across sequential requests.
+///   challenge <ip>                          -> challenge_id=.. challenge=.. bits=..
+///   redeem <burnhex> <user> <id> <nonce>    -> credential ticket=.. | error=<Kind>
+fn issuer_stdio() -> i32 {
+    use std::io::BufRead;
+    struct Confirmed;
+    impl turn_dag_turn::BurnConfirmation for Confirmed {
+        fn is_burn_confirmed(&self, _burn_id: &[u8; 32]) -> bool {
+            true
+        }
+    }
+    let checker = Confirmed;
+    let mut issuer =
+        turn_dag_turn::TurnIssuer::new(b"demo-secret".to_vec(), demo_policy(), &checker);
+    let mut challenges: std::collections::HashMap<
+        String,
+        (turn_dag_turn::TurnPowChallenge, String),
+    > = Default::default();
+    let stdin = std::io::stdin();
+    let mut out = std::io::stdout();
+    use std::io::Write;
+    for line in stdin.lock().lines() {
+        let Ok(line) = line else { break };
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        let resp = match parts.as_slice() {
+            ["challenge", ip] => {
+                let Ok(client_ip) = ip.parse::<IpAddr>() else {
+                    println!("error=BadIp");
+                    let _ = out.flush();
+                    continue;
+                };
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0);
+                match issuer.handle_get_challenge(client_ip, now).body {
+                    Ok(ch) => {
+                        let full = turn_dag_turn::TurnPowChallenge {
+                            challenge_id: ch.challenge_id,
+                            challenge: ch.challenge,
+                            client_ip,
+                            issued_at: now,
+                            expires_at: ch.expires_at,
+                            bits: ch.bits,
+                        };
+                        challenges.insert(hex(&ch.challenge_id), (full, ip.to_string()));
+                        format!(
+                            "challenge_id={} challenge={} bits={}",
+                            hex(&ch.challenge_id),
+                            hex(&ch.challenge),
+                            ch.bits
+                        )
+                    }
+                    Err(e) => format!("error={e:?}"),
+                }
+            }
+            ["redeem", burn_hex, user, id_hex, nonce_str] => {
+                let parsed = (|| {
+                    let burn = hex_decode(burn_hex)?;
+                    if burn.len() != 32 {
+                        return None;
+                    }
+                    let (ch, ip) = challenges.get(*id_hex)?;
+                    let nonce: u64 = nonce_str.parse().ok()?;
+                    Some((burn, ch.clone(), ip.clone(), nonce))
+                })();
+                match parsed {
+                    Some((burn, ch, ip, nonce)) => {
+                        let req = turn_dag_turn::RedeemRequest {
+                            user_id: user.to_string(),
+                            client_ip: ip.parse().unwrap(),
+                            peer_ip: "203.0.113.20".parse().unwrap(),
+                            transport: turn_dag_turn::Transport::Udp,
+                            both_symmetric_nat: false,
+                            burn_id: burn.try_into().unwrap(),
+                            pow: turn_dag_turn::TurnPowSolution {
+                                challenge_id: ch.challenge_id,
+                                nonce,
+                            },
+                        };
+                        let now = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_secs())
+                            .unwrap_or(0);
+                        match issuer.handle_post_redeem(&req, now).body {
+                            Ok(creds) => format!(
+                                "credential ticket={} username={}",
+                                creds[0].ticket_id, creds[0].username
+                            ),
+                            Err(e) => format!("error={e:?}"),
+                        }
+                    }
+                    None => "error=BadRedeemArgs".to_string(),
+                }
+            }
+            _ => "error=UnknownCommand".to_string(),
+        };
+        println!("{resp}");
+        let _ = out.flush();
+    }
+    0
 }
 
 fn arg_val(args: &[String], name: &str) -> Option<String> {

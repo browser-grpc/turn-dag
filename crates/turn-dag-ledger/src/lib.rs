@@ -159,6 +159,7 @@ pub enum LedgerError {
     NotOwner,
     AlreadySpent,
     OriginKeyMismatch,
+    AlreadyRedeemed,
 }
 
 fn entry_hash(
@@ -190,6 +191,10 @@ pub struct Ledger {
     origin: PqAddress,
     entries: Vec<Entry>,
     elements: HashMap<ElementId, Record>,
+    /// Burn entry hashes already redeemed for a relay pass at this
+    /// node (origin-side redemption registry: one burn = one pass,
+    /// enforced across issuer sessions, not just per-process).
+    redeemed: std::collections::HashSet<[u8; 32]>,
 }
 
 impl Ledger {
@@ -198,6 +203,7 @@ impl Ledger {
             origin,
             entries: Vec::new(),
             elements: HashMap::new(),
+            redeemed: Default::default(),
         }
     }
 
@@ -357,6 +363,24 @@ impl Ledger {
             origin_pubkey: origin_key.public_key().to_vec(),
             origin_sig: entry.origin_sig.clone(),
         })
+    }
+
+    /// True iff this burn was already redeemed for a relay pass.
+    pub fn is_redeemed(&self, entry_hash: &[u8; 32]) -> bool {
+        self.redeemed.contains(entry_hash)
+    }
+
+    /// Consume a burn for relay-pass issuance. Fails with
+    /// `AlreadySpent` if the burn does not exist here and with
+    /// `AlreadyRedeemed` on any second redemption.
+    pub fn mark_redeemed(&mut self, entry_hash: &[u8; 32]) -> Result<(), LedgerError> {
+        if !self.is_burned(entry_hash) {
+            return Err(LedgerError::ElementNotFound);
+        }
+        if !self.redeemed.insert(*entry_hash) {
+            return Err(LedgerError::AlreadyRedeemed);
+        }
+        Ok(())
     }
 
     /// True iff `hash` is a burn entry in this ledger (relay-pass gate).

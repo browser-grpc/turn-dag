@@ -51,6 +51,32 @@ fn double_spend_is_rejected_atomically_and_foreign_node_does_not_honor() {
 }
 
 #[test]
+fn node_relay_pass_consumes_burn_exactly_once() {
+    let mut node = Node::new("origin-a", 31);
+    let alice = wallet(3);
+    let bob = wallet(4);
+    let (e1, _) = node.mint_for(&alice, 1, 1_000).unwrap();
+    let (e2, _) = node.mint_for(&bob, 1, 1_010).unwrap();
+    let r1 = node.burn(e1, &alice).unwrap();
+    let r2 = node.burn(e2, &bob).unwrap();
+    let client = ip("203.0.113.10");
+    let peer = ip("203.0.113.20");
+    let c1 = node.relay_pass(&r1, "alice", client, peer, 2_000).unwrap();
+    assert_eq!(c1.expires_at, 2_120);
+    // Replay against the same node: rejected, no second credential.
+    let again = node.relay_pass(&r1, "mallory", client, peer, 2_000);
+    assert!(
+        format!("{again:?}").contains("BurnAlreadyRedeemed"),
+        "{again:?}"
+    );
+    // A different burn still issues (and the first ticket is unharmed).
+    let c2 = node.relay_pass(&r2, "bob", client, peer, 2_100).unwrap();
+    assert_ne!(c1.ticket_id, c2.ticket_id);
+    assert!(node.ledger.is_redeemed(&r1.entry_hash));
+    assert!(node.ledger.is_redeemed(&r2.entry_hash));
+}
+
+#[test]
 fn relay_pass_requires_origin_burn_receipt() {
     let mut node = Node::new("origin-a", 21);
     let alice = wallet(3);

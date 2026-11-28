@@ -87,6 +87,38 @@ impl Node {
     pub fn balance(&self, owner: &PqAddress) -> usize {
         self.ledger.balance(owner)
     }
+    /// Issue a relay pass for `receipt`'s burn, consuming it at this
+    /// origin: a second issuance for the same burn fails with
+    /// `BurnAlreadyRedeemed`, across calls and issuer sessions.
+    pub fn relay_pass(
+        &mut self,
+        receipt: &turn_dag_ledger::BurnReceipt,
+        user: &str,
+        client_ip: std::net::IpAddr,
+        peer_ip: std::net::IpAddr,
+        now: u64,
+    ) -> Result<turn_dag_turn::TurnCredential, String> {
+        if self.ledger.is_redeemed(&receipt.entry_hash) {
+            return Err(format!(
+                "{:?}",
+                turn_dag_turn::RedeemError::BurnAlreadyRedeemed
+            ));
+        }
+        let cred = issue_relay_pass(
+            &self.ledger,
+            b"demo-secret".to_vec(),
+            receipt.entry_hash,
+            user,
+            client_ip,
+            peer_ip,
+            now,
+        )
+        .map_err(|e| format!("{e:?}"))?;
+        self.ledger
+            .mark_redeemed(&receipt.entry_hash)
+            .map_err(|e| format!("mark redeemed: {e:?}"))?;
+        Ok(cred)
+    }
 }
 
 /// Burn checker backed by this node's own ledger (the origin's
