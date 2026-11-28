@@ -45,12 +45,16 @@ pub enum EntryKind {
     Mint,
     Transfer,
     Burn,
+    BondLock,
+    BondUnlock,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LedgerStatus {
     Unspent,
     Burned,
+    /// Locked as an origin-local rate bond (sets session quota).
+    Bonded,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,6 +182,8 @@ fn entry_hash(
         EntryKind::Mint => 1u8,
         EntryKind::Transfer => 2u8,
         EntryKind::Burn => 3u8,
+        EntryKind::BondLock => 4u8,
+        EntryKind::BondUnlock => 5u8,
     }]);
     h.update(element_id.0);
     h.update(from.map(|f| f.0).unwrap_or([0u8; 20]));
@@ -383,6 +389,85 @@ impl Ledger {
         Ok(())
     }
 
+    /// Lock one unspent element as an origin-local rate bond.
+    /// Bonded elements cannot transfer or burn until unlocked.
+    /// This bond exists to price session quota (see
+    /// `bond_balance`); it is not double-spend insurance - the
+    /// serial ledger already prevents that atomically.
+    pub fn bond_lock(
+        &mut self,
+        element_id: ElementId,
+        owner: &HotWallet,
+        origin_key: &HotWallet,
+    ) -> Result<Entry, LedgerError> {
+        self.check_origin_key(origin_key)?;
+        let rec = self
+            .elements
+            .get(&element_id)
+            .ok_or(LedgerError::ElementNotFound)?;
+        if rec.owner != owner.address() {
+            return Err(LedgerError::NotOwner);
+        }
+        if rec.status != LedgerStatus::Unspent {
+            return Err(LedgerError::AlreadySpent);
+        }
+        let entry = self.append(
+            EntryKind::BondLock,
+            element_id,
+            Some(owner.address()),
+            owner.address(),
+            owner,
+            origin_key,
+        );
+        self.elements.get_mut(&element_id).unwrap().status = LedgerStatus::Bonded;
+        Ok(entry)
+    }
+
+    /// Unlock a bonded element back to Unspent.
+    pub fn bond_unlock(
+        &mut self,
+        element_id: ElementId,
+        owner: &HotWallet,
+        origin_key: &HotWallet,
+    ) -> Result<Entry, LedgerError> {
+        self.check_origin_key(origin_key)?;
+        let rec = self
+            .elements
+            .get(&element_id)
+            .ok_or(LedgerError::ElementNotFound)?;
+        if rec.owner != owner.address() {
+            return Err(LedgerError::NotOwner);
+        }
+        if rec.status != LedgerStatus::Bonded {
+            return Err(LedgerError::AlreadySpent);
+        }
+        let entry = self.append(
+            EntryKind::BondUnlock,
+            element_id,
+            Some(owner.address()),
+            owner.address(),
+            owner,
+            origin_key,
+        );
+        self.elements.get_mut(&element_id).unwrap().status = LedgerStatus::Unspent;
+        Ok(entry)
+    }
+
+    /// Elements currently locked as rate bond by `owner`.
+    pub fn bond_balance(&self, owner: &PqAddress) -> usize {
+        self.elements
+            .values()
+            .filter(|r| r.owner == *owner && r.status == LedgerStatus::Bonded)
+            .count()
+    }
+
+    /// Concurrent relay-pass quota for `owner`: a free baseline of
+    /// 1, plus one per bonded element. Big hardware buys speed, not
+    /// session count - identities are priced in locked elements.
+    pub fn session_quota(&self, owner: &PqAddress) -> usize {
+        1 + self.bond_balance(owner)
+    }
+
     /// True iff `hash` is a burn entry in this ledger (relay-pass gate).
     pub fn is_burned(&self, entry_hash: &[u8; 32]) -> bool {
         self.entries
@@ -517,6 +602,33 @@ mod tests {
         // Byte-string encoding keeps it close to raw field sizes
         // (pubkey 1952 + sig 3309 dominate; framing adds only bytes).
         assert!(bytes.len() < 1952 + 3309 + 200, "cbor len {}", bytes.len());
+    }
+
+    #[test]
+    fn bond_locks_unlocks_and_prices_quota() {
+        let origin = wallet(1);
+        let alice = wallet(2);
+        let bob = wallet(3);
+        let mut l = Ledger::new(origin.address());
+        let e1 = ElementId([11u8; 32]);
+        let e2 = ElementId([12u8; 32]);
+        l.mint(e1, &alice, &origin).unwrap();
+        l.mint(e2, &alice, &origin).unwrap();
+        assert_eq!(l.session_quota(&alice.address()), 1, "free baseline");
+        l.bond_lock(e1, &alice, &origin).unwrap();
+        assert_eq!(l.bond_balance(&alice.address()), 1);
+        assert_eq!(l.session_quota(&alice.address()), 2);
+        // Bonded elements are frozen.
+        assert_eq!(
+            l.transfer(e1, &alice, bob.address(), &origin),
+            Err(LedgerError::AlreadySpent)
+        );
+        assert_eq!(l.burn(e1, &alice, &origin), Err(LedgerError::AlreadySpent));
+        l.bond_lock(e2, &alice, &origin).unwrap();
+        assert_eq!(l.session_quota(&alice.address()), 3);
+        l.bond_unlock(e1, &alice, &origin).unwrap();
+        assert_eq!(l.session_quota(&alice.address()), 2);
+        assert!(l.verify_chain());
     }
 
     #[test]

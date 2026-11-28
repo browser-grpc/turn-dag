@@ -57,6 +57,12 @@ pub struct AllocationPolicy {
     pub pow_bits: u32,
     /// TURN PoW challenge lifetime seconds.
     pub pow_ttl_secs: u64,
+    /// Interval after which a live session must present the next
+    /// chained re-PoW link (spec: renew while relayed at 90s; the
+    /// chain makes each link depend on live session state).
+    pub session_link_interval_secs: u64,
+    /// Leading-zero bits required per session chain link.
+    pub session_link_bits: u32,
 }
 
 impl Default for AllocationPolicy {
@@ -71,6 +77,8 @@ impl Default for AllocationPolicy {
             credential_lifetime_secs: 120,
             pow_bits: TURN_POW_BITS,
             pow_ttl_secs: 120,
+            session_link_interval_secs: 30,
+            session_link_bits: 10,
         }
     }
 }
@@ -604,6 +612,131 @@ impl RelaySession {
     }
 }
 
+// ---------------- chained session re-PoW ----------------
+//
+// A session chain makes long-lived relay sessions prove ongoing
+// presence with *sequential* work: link n+1 hashes link n, so the
+// next solution cannot be computed before the current head exists.
+// Big hardware parallelizes across sessions, not within one -
+// per-session progress is time-bound, not hash-rate-bound, and a
+// stockpile of precomputed solutions is worthless because each
+// preimage contains a head the solver cannot know in advance.
+
+/// Head of a fresh session chain for `ticket_id`.
+pub fn chain_genesis(ticket_id: &str) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"turn-session-chain-v1");
+    h.update(ticket_id.as_bytes());
+    h.finalize().into()
+}
+
+fn chain_link_hash(prev: &[u8; 32], nonce: u64) -> [u8; 32] {
+    let mut h = Sha256::new();
+    h.update(b"turn-session-link-v1");
+    h.update(prev);
+    h.update(nonce.to_be_bytes());
+    h.finalize().into()
+}
+
+/// One solved chain link: the nonce producing the next head.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ChainLink {
+    pub nonce: u64,
+}
+
+/// Solve the next link from `prev` (scans nonces like TURN PoW).
+pub fn solve_chain_link(prev: &[u8; 32], bits: u32) -> ChainLink {
+    let mut nonce: u64 = 0;
+    loop {
+        if leading_zero_bits(&chain_link_hash(prev, nonce)) >= bits {
+            return ChainLink { nonce };
+        }
+        nonce = nonce.wrapping_add(1);
+    }
+}
+
+/// Verify a link against `prev` with one hash.
+pub fn verify_chain_link(prev: &[u8; 32], link: &ChainLink, bits: u32) -> bool {
+    leading_zero_bits(&chain_link_hash(prev, link.nonce)) >= bits
+}
+
+#[derive(Clone, Debug)]
+struct SessionState {
+    head: [u8; 32],
+    links: u64,
+    last_link_at: u64,
+}
+
+/// Tracks session chains per ticket. A session is *fresh* while
+/// its last verified link is younger than the policy interval;
+/// after that, relay use should demand the next link (which the
+/// client could only have computed after the previous head was
+/// issued - precomputation is structurally useless).
+#[derive(Default)]
+pub struct SessionChainKeeper {
+    sessions: HashMap<String, SessionState>,
+    interval_secs: u64,
+    bits: u32,
+}
+
+impl SessionChainKeeper {
+    pub fn new(policy: &AllocationPolicy) -> Self {
+        Self {
+            sessions: HashMap::new(),
+            interval_secs: policy.session_link_interval_secs,
+            bits: policy.session_link_bits,
+        }
+    }
+
+    /// Register a freshly issued ticket (chain starts at genesis).
+    pub fn register(&mut self, ticket_id: &str, now: u64) {
+        self.sessions.insert(
+            ticket_id.to_string(),
+            SessionState {
+                head: chain_genesis(ticket_id),
+                links: 0,
+                last_link_at: now,
+            },
+        );
+    }
+
+    pub fn is_fresh(&self, ticket_id: &str, now: u64) -> bool {
+        match self.sessions.get(ticket_id) {
+            Some(s) => now.saturating_sub(s.last_link_at) < self.interval_secs,
+            None => false,
+        }
+    }
+
+    pub fn links(&self, ticket_id: &str) -> u64 {
+        self.sessions.get(ticket_id).map(|s| s.links).unwrap_or(0)
+    }
+
+    /// Current head a client must build the next link on.
+    pub fn head(&self, ticket_id: &str) -> Option<[u8; 32]> {
+        self.sessions.get(ticket_id).map(|s| s.head)
+    }
+
+    /// Submit the next link. On success the head advances and the
+    /// freshness clock restarts; a solution computed against any
+    /// other head (e.g. precomputed for a guessed future) fails.
+    pub fn submit_link(&mut self, ticket_id: &str, link: &ChainLink, now: u64) -> bool {
+        let Some(s) = self.sessions.get_mut(ticket_id) else {
+            return false;
+        };
+        if !verify_chain_link(&s.head, link, self.bits) {
+            return false;
+        }
+        s.head = chain_link_hash(&s.head, link.nonce);
+        s.links += 1;
+        s.last_link_at = now;
+        true
+    }
+
+    pub fn forget(&mut self, ticket_id: &str) {
+        self.sessions.remove(ticket_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -910,6 +1043,47 @@ mod tests {
         assert!(!s2.is_relay_active());
         // Direct success before 90s never triggers renewal.
         assert_eq!(s2.tick(500), RelayState::DirectDropped);
+    }
+
+    #[test]
+    fn session_chain_freshness_links_and_precompute_resistance() {
+        let policy = AllocationPolicy {
+            session_link_bits: 8,
+            session_link_interval_secs: 30,
+            ..AllocationPolicy::default()
+        };
+        let mut keeper = SessionChainKeeper::new(&policy);
+        keeper.register("ticket-1", 1_000);
+        assert!(keeper.is_fresh("ticket-1", 1_000));
+        assert!(keeper.is_fresh("ticket-1", 1_029));
+        assert!(!keeper.is_fresh("ticket-1", 1_030), "stale after interval");
+        assert!(!keeper.is_fresh("unknown", 1_000));
+
+        // Solve + submit link 1: fresh again, head advances.
+        let head0 = keeper.head("ticket-1").unwrap();
+        let link1 = solve_chain_link(&head0, 8);
+        assert!(verify_chain_link(&head0, &link1, 8));
+        assert!(keeper.submit_link("ticket-1", &link1, 1_030));
+        assert_ne!(keeper.head("ticket-1").unwrap(), head0);
+        assert!(keeper.is_fresh("ticket-1", 1_059));
+        assert_eq!(keeper.links("ticket-1"), 1);
+
+        // The same link cannot be replayed (head has moved).
+        assert!(!keeper.submit_link("ticket-1", &link1, 1_031));
+
+        // Precomputation fails: a solution mined for a guessed
+        // future head does not verify against the real head.
+        let guessed_head = chain_link_hash(&keeper.head("ticket-1").unwrap(), 999);
+        let precomputed = solve_chain_link(&guessed_head, 8);
+        assert!(!keeper.submit_link("ticket-1", &precomputed, 1_032));
+
+        // Link 2 must build on the real current head.
+        let head1 = keeper.head("ticket-1").unwrap();
+        let link2 = solve_chain_link(&head1, 8);
+        assert!(keeper.submit_link("ticket-1", &link2, 1_060));
+        assert_eq!(keeper.links("ticket-1"), 2);
+        keeper.forget("ticket-1");
+        assert!(!keeper.is_fresh("ticket-1", 1_060));
     }
 
     #[test]

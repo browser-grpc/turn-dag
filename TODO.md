@@ -255,7 +255,7 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   ChannelData stream framing in `take_frame`). Firefox turns:
   SKIPs with evidence — packet capture shows this Firefox build
   attempts `turn:?transport=tcp` but never initiates `turns:`.
-- Verified: `cargo test --workspace` (90 tests after the ledger cutover), clippy, fmt,
+- Verified: `cargo test --workspace` (92 tests after the ledger cutover), clippy, fmt,
   `docker build --target ci`, and
   `docker build --target browser && docker run --rm --network host --cap-add NET_ADMIN --device /dev/net/tun turn-dag:browser`
   (52 passed, 3 skipped — Firefox + WebKit turns and fresh-context
@@ -344,6 +344,28 @@ Do in order. Each step: implement, test in Docker, commit, do not skip tests.
   `issuer:burn-replay-stdio` drives one long-lived TurnIssuer
   through the stateful `issuer-stdio` oracle: burn A redeems,
   its replay is `BurnAlreadyRedeemed`, burn B still redeems.
+
+## Anti-big-hardware mitigations (2026-11-26)
+
+- **Origin-local rate bond** (different job from the deleted
+  DAG-era bond): locking elements at the origin sets concurrent
+  session quota, `1 + bonded elements` free baseline 1
+  (`Ledger::{bond_lock,bond_unlock,bond_balance,session_quota}`,
+  enforced in `Node::relay_pass` with per-user active-pass
+  expiry tracking; a quota-blocked pass does not consume its
+  burn). Identities are priced in locked elements, so Sybil
+  session count costs capital, not hash power. This is not
+  double-spend insurance - the serial ledger prevents that.
+- **Chained session re-PoW**: `SessionChainKeeper` (turn crate)
+  requires a fresh link every `session_link_interval_secs`
+  (30s): link n+1 hashes link n's head, so solutions cannot be
+  precomputed or parallelized within a session - progress is
+  time-bound per session while verification stays one hash.
+  Links cannot be replayed (the head moves), and a solution for
+  a guessed future head fails. Policy knobs:
+  `session_link_interval_secs`, `session_link_bits` (default 10).
+  The keeper is the session-layer primitive; wiring it into the
+  wire server's renewal path is the follow-on step.
 
 ## Decisions (settled 2026-11-25, "go all, pick as needed")
 

@@ -61,19 +61,42 @@ fn node_relay_pass_consumes_burn_exactly_once() {
     let r2 = node.burn(e2, &bob).unwrap();
     let client = ip("203.0.113.10");
     let peer = ip("203.0.113.20");
-    let c1 = node.relay_pass(&r1, "alice", client, peer, 2_000).unwrap();
+    let c1 = node.relay_pass(&r1, &alice, client, peer, 2_000).unwrap();
     assert_eq!(c1.expires_at, 2_120);
     // Replay against the same node: rejected, no second credential.
-    let again = node.relay_pass(&r1, "mallory", client, peer, 2_000);
+    let mallory = wallet(77);
+    let again = node.relay_pass(&r1, &mallory, client, peer, 2_000);
     assert!(
         format!("{again:?}").contains("BurnAlreadyRedeemed"),
         "{again:?}"
     );
     // A different burn still issues (and the first ticket is unharmed).
-    let c2 = node.relay_pass(&r2, "bob", client, peer, 2_100).unwrap();
+    let c2 = node.relay_pass(&r2, &bob, client, peer, 2_100).unwrap();
     assert_ne!(c1.ticket_id, c2.ticket_id);
     assert!(node.ledger.is_redeemed(&r1.entry_hash));
     assert!(node.ledger.is_redeemed(&r2.entry_hash));
+
+    // Bond-priced quota: Alice has one active pass and no bond -
+    // a second concurrent pass is refused; locking one element
+    // as rate bond raises her quota and the same pass succeeds.
+    let (e3, _) = node.mint_for(&alice, 1, 1_030).unwrap();
+    let (e4, _) = node.mint_for(&alice, 1, 1_040).unwrap();
+    let (bond_el, _) = node.mint_for(&alice, 1, 1_050).unwrap();
+    let r3 = node.burn(e3, &alice).unwrap();
+    let blocked = node.relay_pass(&r3, &alice, client, peer, 2_050);
+    assert!(
+        format!("{blocked:?}").contains("UserQuotaExceeded"),
+        "baseline quota=1 must block a second concurrent pass: {blocked:?}"
+    );
+    assert!(
+        !node.ledger.is_redeemed(&r3.entry_hash),
+        "blocked pass must not consume the burn"
+    );
+    node.bond_lock(bond_el, &alice).unwrap();
+    let _c3 = node.relay_pass(&r3, &alice, client, peer, 2_050).unwrap();
+    // After the first pass expires, the baseline quota frees again.
+    let r4 = node.burn(e4, &alice).unwrap();
+    let _c4 = node.relay_pass(&r4, &alice, client, peer, 2_200).unwrap();
 }
 
 #[test]

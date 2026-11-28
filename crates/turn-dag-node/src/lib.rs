@@ -31,6 +31,8 @@ pub struct Node {
     pub name: String,
     pub ledger: Ledger,
     pub wallet: HotWallet,
+    /// Active relay-pass expiry times per user (bond-priced quota).
+    active_passes: std::collections::HashMap<PqAddress, Vec<u64>>,
 }
 
 impl Node {
@@ -41,6 +43,7 @@ impl Node {
             name: name.into(),
             ledger,
             wallet,
+            active_passes: Default::default(),
         }
     }
     pub fn address(&self) -> PqAddress {
@@ -93,7 +96,7 @@ impl Node {
     pub fn relay_pass(
         &mut self,
         receipt: &turn_dag_ledger::BurnReceipt,
-        user: &str,
+        user: &HotWallet,
         client_ip: std::net::IpAddr,
         peer_ip: std::net::IpAddr,
         now: u64,
@@ -104,11 +107,24 @@ impl Node {
                 turn_dag_turn::RedeemError::BurnAlreadyRedeemed
             ));
         }
+        // Bond-priced concurrent-session quota: 1 free, +1 per
+        // element locked as rate bond at this origin. Session
+        // count costs locked elements, not hash power.
+        let quota = self.ledger.session_quota(&user.address());
+        let active = self.active_passes.entry(user.address()).or_default();
+        active.retain(|exp| *exp > now);
+        if active.len() >= quota {
+            return Err(format!(
+                "{:?}",
+                turn_dag_turn::RedeemError::UserQuotaExceeded
+            ));
+        }
+        let user_label = hex(&user.address().0);
         let cred = issue_relay_pass(
             &self.ledger,
             b"demo-secret".to_vec(),
             receipt.entry_hash,
-            user,
+            &user_label,
             client_ip,
             peer_ip,
             now,
@@ -117,7 +133,23 @@ impl Node {
         self.ledger
             .mark_redeemed(&receipt.entry_hash)
             .map_err(|e| format!("mark redeemed: {e:?}"))?;
+        self.active_passes
+            .entry(user.address())
+            .or_default()
+            .push(cred.expires_at);
         Ok(cred)
+    }
+
+    /// Lock one of `owner`'s elements as rate bond at this node.
+    pub fn bond_lock(
+        &mut self,
+        element_id: ElementId,
+        owner: &HotWallet,
+    ) -> Result<[u8; 32], String> {
+        self.ledger
+            .bond_lock(element_id, owner, &self.wallet)
+            .map(|e| e.hash)
+            .map_err(|e| format!("bond_lock: {e:?}"))
     }
 }
 
